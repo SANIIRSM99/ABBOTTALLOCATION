@@ -978,9 +978,17 @@ function renderInvoiceTable() {
         });
     });
 
-    if (selectedFilter === "itemSummary") {
+   if (selectedFilter === "itemSummary" || selectedFilter === "nonProductiveItemSummary") {
+
         // --- Render Item Summary Table (QTY-based) ---
         Object.entries(itemSummary).forEach(([item, data]) => {
+           // 🚫 Non Productive Item Summary ONLY
+if (
+    selectedFilter === "nonProductiveItemSummary" &&
+    data.totalTargetQty > 0 &&
+    data.totalAchievedQty > 0
+) return;
+
             if (selectedItem !== "all" && selectedItem !== item) return;
             const perc = data.totalTargetQty>0?((data.totalAchievedQty/data.totalTargetQty)*100).toFixed(1):0;
             let rowClass = "bg-gray-50";
@@ -1206,6 +1214,11 @@ function showFilteredPopup() {
     let popupThead = ""; // dynamic header
 
     if (selectedStatus === "itemSummary") {
+       if (
+    selectedStatus === "itemSummary" ||
+    selectedStatus === "nonProductiveItemSummary"
+) {
+
         // --- Item-based summary for popup ---
         let itemSummary = {};
         Object.entries(customerTargets).forEach(([customerCode, customer]) => {
@@ -1251,6 +1264,13 @@ function showFilteredPopup() {
         `;
 
         Object.entries(itemSummary).forEach(([item, data]) => {
+           // 🚫 Non Productive Item Summary (Popup)
+if (
+    selectedStatus === "nonProductiveItemSummary" &&
+    data.totalTarget > 0 &&
+    data.totalAchieved > 0
+) return;
+
             if (selectedItemValue !== "all" && selectedItemValue !== item) return;
 
             const percentage = data.totalTarget > 0 ? ((data.totalAchieved / data.totalTarget) * 100).toFixed(1) : 0;
