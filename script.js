@@ -830,7 +830,6 @@ function renderInvoiceTable() {
         return;
     }
 
-
     // --- Add filters only once ---
     if (thead && !document.getElementById("statusFilter")) {
         const filterRow = document.createElement("tr");
@@ -848,6 +847,7 @@ function renderInvoiceTable() {
                                 <option value="nonProductive">🚫 Non Productive</option>
                                 <option value="top10">🏆 Top 10 Customers</option>
                                 <option value="itemSummary">📊 Item Summary</option>
+                                 <option value="nonProductiveItemSummary">🚫 Non Productive Item</option>
                             </select>
                             <label class="font-bold">Filter by Item:</label>
                             <select id="itemFilter" class="w-full sm:w-auto border p-1 rounded text-sm">
@@ -978,7 +978,7 @@ function renderInvoiceTable() {
         });
     });
 
-   if (selectedFilter === "itemSummary" || selectedFilter === "nonProductiveItemSummary") {
+    if (selectedFilter === "itemSummary" || selectedFilter === "nonProductiveItemSummary") {
 
         // --- Render Item Summary Table (QTY-based) ---
         Object.entries(itemSummary).forEach(([item, data]) => {
@@ -1169,7 +1169,7 @@ if (selectedFilter === "nonProductive") {
             const newsHtml = zeroAchieveCustomers.map(c=>{
                 const color = colors[index%colors.length];
                 index++;
-               return `<span class="${color} mx-2 sm:mx-4 cursor-pointer underline" 
+                return `<span class="${color} mx-2 sm:mx-4 cursor-pointer underline" 
              onclick="openCustomerPopup('${c.code}')">
              🚨 ${c.name} [${c.code}]
         </span>`;
@@ -1179,7 +1179,6 @@ if (selectedFilter === "nonProductive") {
         }else breakingNews.innerHTML='<span class="text-gray-600 flex items-center justify-center h-full">No alerts at this time</span>';
     }
 }
-
 
 
 
@@ -1213,8 +1212,7 @@ function showFilteredPopup() {
 
     let popupThead = ""; // dynamic header
 
-    if (selectedStatus === "itemSummary") {
-       if (
+   if (
     selectedStatus === "itemSummary" ||
     selectedStatus === "nonProductiveItemSummary"
 ) {
@@ -1408,7 +1406,7 @@ popupRows += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:t
         <td class="border p-2">${totalTarget}</td>
         <td class="border p-2">${totalAchieved}</td>
         <td class="border p-2">${totalRemaining}</td>
-        <td class="border p-2">  ${calculateSmartPerformance()}% </td>
+        <td class="border p-2">  ${calculateSmartPerformance()}% </td> 
         <td class="border p-2">${totalValue.toLocaleString()}</td>
     </tr>`;
 
@@ -1515,6 +1513,7 @@ popupRows += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:t
 
     popup.classList.remove("hidden");
 }
+
 
 
 
