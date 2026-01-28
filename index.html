@@ -792,36 +792,59 @@ modal.addEventListener('click', (e) => {
     </div>
   </div>
 
-<footer class="mt-10">
-  <div class="relative max-w-6xl mx-auto px-6 py-4 rounded-2xl bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 shadow-xl flex flex-col sm:flex-row items-center justify-between gap-4">
+ <!-- Incharge Engineer – standout piece -->
+      <div class="relative group">
+        <div class="absolute inset-0 bg-gradient-to-r from-green-500/20 via-blue-500/20 to-purple-500/20 rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
+        
+        <div class="relative bg-gray-900/40 backdrop-blur-sm border border-gray-700/50 rounded-2xl px-6 py-4">
+          <p class="text-base font-semibold tracking-wide">
+            <span class="text-gray-300">IT Incharge Engineer</span><br>
+            <span class="text-xl font-extrabold bg-gradient-to-r from-emerald-400 via-cyan-400 to-purple-400 bg-clip-text text-transparent">
+              M. Tahir
+            </span>
+          </p>
+        </div>
+      </div>
 
-    <!-- Decorative glowing circles -->
-    <span class="absolute -top-3 -left-3 w-16 h-16 bg-blue-400 rounded-full opacity-20 blur-xl animate-pulse"></span>
-    <span class="absolute -bottom-3 -right-3 w-20 h-20 bg-purple-500 rounded-full opacity-20 blur-xl animate-pulse delay-200"></span>
+      <!-- Contact -->
+      <div class="text-gray-300 space-y-2">
+        <p class="text-sm font-medium hover:text-white transition-colors">
+          <span class="text-lg mr-1.5">✉</span>
+          <a href="mailto:saniirsm99@gmail.com" class="hover:underline">
+            saniirsm99@gmail.com
+          </a>
+        </p>
+        <p class="text-sm font-medium hover:text-white transition-colors">
+          <span class="text-lg mr-1.5">📞</span>
+          <a href="tel:+923117323373" class="hover:underline">
+            0311-7323373
+          </a>
+        </p>
+      </div>
 
-    <!-- Developer -->
-    <div class="text-center sm:text-left">
-      <p class="text-sm sm:text-base font-medium text-gray-300">
-        Developed by 
-        <span class="font-bold text-yellow-400 text-lg sm:text-xl">Sani Hashmi</span>
-      </p>
     </div>
 
-    <!-- Incharge Engineer -->
-    <div class="text-center">
-      <p class="text-sm sm:text-base font-semibold bg-gradient-to-r from-green-400 via-blue-500 to-purple-500 text-transparent bg-clip-text">
-      IT Incharge Engineer <span class="font-extrabold">M. Tahir</span>
+    <!-- Optional bottom line -->
+    <div class="mt-10 pt-6 border-t border-gray-800/40 text-center">
+      <p class="text-xs text-gray-500">
+        SANI HASHMI • All rights reserved
       </p>
-    </div>
-
-    <!-- Contact Info -->
-    <div class="text-center sm:text-right text-gray-300">
-      <p class="text-sm">📧 <span class="text-white font-medium">saniirsm99@gmail.com</span></p>
-      <p class="text-sm">📞 <span class="text-white font-medium">0311-7323373</span></p>
     </div>
 
   </div>
 </footer>
+
+<style>
+  @keyframes pulse-slow {
+    0%, 100% { opacity: 0.4; transform: scale(1); }
+    50%      { opacity: 0.15; transform: scale(1.15); }
+  }
+  .animate-pulse-slow {
+    animation: pulse-slow 12s infinite ease-in-out;
+  }
+  .delay-1000 {
+    animation-delay: 1s;
+  }
   <script type="module" src="script.js"></script>
 <!-- Firebase App (Base SDK) -->
 <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-app-compat.js"></script>
