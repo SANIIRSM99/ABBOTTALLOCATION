@@ -1400,15 +1400,17 @@ popupRows += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:t
 
     // --- Summary Footer Row ---
    const summaryRow = `
-    <tr class="bg-indigo-100 font-bold text-xs sm:text-sm">
-        <td colspan="2" class="border p-2 text-center">TOTAL (${totalCustomers} Customers)</td>
-        <td class="border p-2">${totalItems} Items</td>
-        <td class="border p-2">${totalTarget}</td>
-        <td class="border p-2">${totalAchieved}</td>
-        <td class="border p-2">${totalRemaining}</td>
-        <td class="border p-2">  ${calculateSmartPerformance()}% </td> 
-        <td class="border p-2">${totalValue.toLocaleString()}</td>
-    </tr>`;
+<tr class="bg-indigo-100 font-bold text-xs sm:text-sm">
+    <td class="border p-2 text-center">TOTAL</td>
+    <td class="border p-2 text-center">${totalItems}</td>
+
+    <td class="border p-2">${totalTarget}</td>
+    <td class="border p-2">${totalAchieved}</td>
+    <td class="border p-2">${totalRemaining}</td>
+    <td class="border p-2">${calculateSmartPerformance()}%</td>
+    <td class="border p-2">${totalValue.toLocaleString()}</td>
+</tr>`;
+
 
     let popup = document.getElementById("invoicePopup");
 
