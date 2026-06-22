@@ -3017,13 +3017,16 @@ function renderMySaleTable() {
   let rows = "";
   let grandTotal = 0;
   const grouped = {};
+  const companyTotals = {};
   mySaleData
     .map(normalizeSaleRecord)
-    .sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.summary || "").localeCompare(b.summary || ""))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.company || "").localeCompare(b.company || "") || (a.summary || "").localeCompare(b.summary || ""))
     .forEach(sale => {
       const dateKey = sale.date || "No Date";
       if (!grouped[dateKey]) grouped[dateKey] = [];
       grouped[dateKey].push(sale);
+      const companyKey = sale.company || sale.summary || "Unknown Company";
+      companyTotals[companyKey] = (companyTotals[companyKey] || 0) + (Number(sale.value) || 0);
     });
   Object.entries(grouped).forEach(([date, sales]) => {
     let dateTotal = 0;
@@ -3043,6 +3046,15 @@ function renderMySaleTable() {
       <td colspan="2" class="border p-2 text-right">Date Total</td>
       <td class="border p-2 text-right">${formatNumber(dateTotal)}</td>
       <td class="border p-2 text-center">${escapeHtml(date)}</td>
+    </tr>`;
+  });
+
+  rows += `<tr class="bg-blue-100 font-bold"><td colspan="4" class="border p-2">Company Wise Total</td></tr>`;
+  Object.entries(companyTotals).sort((a, b) => b[1] - a[1]).forEach(([company, total]) => {
+    rows += `<tr class="bg-blue-50">
+      <td colspan="2" class="border p-2">${escapeHtml(company)}</td>
+      <td class="border p-2 text-right font-bold">${formatNumber(total)}</td>
+      <td class="border p-2 text-center">1 to Today</td>
     </tr>`;
   });
 
@@ -3330,6 +3342,11 @@ async function saveMySaleToFirebase(records) {
       if (!byUser[user]) byUser[user] = [];
       byUser[user].push(row);
     });
+    if (!Object.keys(byUser).length) {
+      const user = (getActiveDataUser() || getLoggedUser() || "").toString().trim().toUpperCase();
+      if (!user || user === "ALL") return;
+      byUser[user] = [];
+    }
     await Promise.all(Object.entries(byUser).map(([user, rows]) => {
       const payload = {
         uploadedAt: new Date().toISOString(),
@@ -3410,38 +3427,25 @@ function addManualSale() {
   });
 }
 
-// process parsed CSV rows (merge by summary)
+// process parsed CSV rows (merge by user/date/company/summary)
 function processSaleCsvRows(rows) {
   if (!rows || rows.length === 0) return;
 
   const records = parseSaleCsvRecords(rows);
   const batchMap = {};
   records.forEach(record => {
-    if (!batchMap[record.summary]) batchMap[record.summary] = { summary: record.summary, company: record.company, value: 0, date: record.date, user: record.user1 || record.user2 || getActiveDataUser() };
-    batchMap[record.summary].value += Number(record.value);
-    batchMap[record.summary].company = record.company || batchMap[record.summary].company;
-    batchMap[record.summary].date = pickLatestDate(batchMap[record.summary].date, record.date);
+    const saleUser = record.user1 || record.user2 || getActiveDataUser();
+    const key = `${saleUser}|${record.date || ""}|${record.summary}|${record.company}`;
+    if (!batchMap[key]) batchMap[key] = { summary: record.summary, company: record.company, value: 0, date: record.date, user: saleUser };
+    batchMap[key].value += Number(record.value);
+    batchMap[key].company = record.company || batchMap[key].company;
+    batchMap[key].date = pickLatestDate(batchMap[key].date, record.date);
   });
 
-  let added = 0, updated = 0;
-  Object.values(batchMap).forEach(sale => {
-    const existing = mySaleData.find(s => String(s.summary) === String(sale.summary));
-    if (existing) {
-      existing.value = sale.value;
-      existing.company = sale.company || existing.company;
-      existing.date = sale.date || existing.date;
-      updated++;
-    } else {
-      mySaleData.push(sale);
-      added++;
-    }
-  });
-
-  localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
-  renderMySaleTable();
+  upsertLocalSaleRecords(Object.values(batchMap));
   saveMySaleToFirebase(Object.values(batchMap));
   renderBookerRankingBox();
-  console.log(`MySale: added ${added}, updated ${updated}`);
+  console.log(`MySale: processed ${Object.keys(batchMap).length} sale rows`);
   return records;
 }
 
@@ -3480,6 +3484,7 @@ function resetMySale() {
   mySaleData = [];
   localStorage.removeItem("mySaleData");
   renderMySaleTable();
+  saveMySaleToFirebase([]);
   console.log("MySale: reset");
   alert("✅ My Sale data has been reset successfully!");
 }
