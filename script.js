@@ -364,6 +364,33 @@ function setTargetForZeroItem(customerCode, item) {
   processCSVData(fullExcelData);
 }
 
+function applyTargetToAllZeroItems() {
+  const input = document.getElementById("zeroTargetApplyAllValue");
+  const newTarget = Number(input?.value || 0);
+  if (!newTarget || newTarget <= 0) {
+    alert("Please enter target greater than 0.");
+    return;
+  }
+  let updated = 0;
+  const updateRows = (rows, shouldCount = false) => (rows || []).map(row => {
+    const hasItem = (row.CustomerCode || "").toString().trim() && (row.Item1 || "").toString().trim();
+    if (hasItem && Number(row.Target1 || 0) === 0) {
+      if (shouldCount) updated++;
+      return { ...row, Target1: newTarget };
+    }
+    return row;
+  });
+  fullExcelData = updateRows(fullExcelData.length ? fullExcelData : JSON.parse(localStorage.getItem("excelDataAll") || "[]"), true);
+  excelData = updateRows(excelData);
+  bookerRankSourceRows = updateRows(bookerRankSourceRows);
+  localStorage.setItem("excelDataAll", JSON.stringify(fullExcelData));
+  localStorage.setItem("excelData", JSON.stringify(excelData));
+  localStorage.setItem("bookerRankSourceRows", JSON.stringify(bookerRankSourceRows));
+  saveTargetUpdateToFirebase();
+  processCSVData(fullExcelData);
+  alert(`Target applied to ${updated} zero target rows.`);
+}
+
 /**
  * Save processed CSV rows (mapped array) online.
  * Uses: 1) if window.FIREBASE_UPLOAD_ENDPOINT set -> POST there
@@ -983,6 +1010,9 @@ function renderInvoiceTable() {
                                 <option value="itemSummary">📊 Item Summary</option>
                                  <option value="nonProductiveItemSummary">🚫 Non Productive Item</option>
                             </select>
+                            <label class="font-bold">Apply All Zero Target:</label>
+                            <input id="zeroTargetApplyAllValue" type="number" min="1" class="w-full sm:w-24 border p-1 rounded text-sm" placeholder="Target">
+                            <button type="button" onclick="applyTargetToAllZeroItems()" class="w-full sm:w-auto bg-orange-600 hover:bg-orange-700 text-white font-semibold px-3 py-1 rounded text-sm">Apply All</button>
                             <label class="font-bold">Filter by Item:</label>
                             <select id="itemFilter" class="w-full sm:w-auto border p-1 rounded text-sm">
                                 <option value="all">📦 All Items</option>
@@ -1094,7 +1124,7 @@ function renderInvoiceTable() {
     let itemSummary = {};
     Object.entries(customerTargets).forEach(([customerCode, customer]) => {
         Object.entries(customer.items).forEach(([item, targetQty]) => {
-            if (!itemSummary[item]) itemSummary[item] = { totalTargetQty:0, totalAchievedQty:0, totalRemainingQty:0, totalValue:0, customerCount:0 };
+            if (!itemSummary[item]) itemSummary[item] = { totalTargetQty:0, totalAchievedQty:0, totalRemainingQty:0, totalValue:0, customerCount:0, achievedCustomerCount:0 };
 
             const matchingInvoices = invoices.filter(inv =>
                 inv.customerCode?.toUpperCase() === customerCode.toUpperCase() &&
@@ -1109,6 +1139,7 @@ function renderInvoiceTable() {
             itemSummary[item].totalRemainingQty += (Number(targetQty) - achievedQty);
             itemSummary[item].totalValue += achievedValue;
             itemSummary[item].customerCount += 1;
+            if (achievedQty > 0) itemSummary[item].achievedCustomerCount += 1;
         });
     });
 
@@ -1131,7 +1162,7 @@ if (
 
             rowsHtml += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:text-sm">
                 <td class="border p-1 sm:p-2"></td>
-                <td class="border p-1 sm:p-2"></td>
+                <td class="border p-1 sm:p-2">${data.achievedCustomerCount} Chali Gai</td>
                 <td class="border p-1 sm:p-2">${data.customerCount} Customers</td>
                 <td class="border p-1 sm:p-2">${item}</td>
                 <td class="border p-1 sm:p-2">${data.totalTargetQty.toLocaleString()}</td>
@@ -1386,6 +1417,7 @@ function showFilteredPopup() {
     let totalAchieved = 0;
     let totalRemaining = 0;
     let totalValue = 0;
+    let totalAchievedCustomers = 0;
 
     let popupThead = ""; // dynamic header
 
@@ -1399,7 +1431,7 @@ function showFilteredPopup() {
         Object.entries(customerTargets).forEach(([customerCode, customer]) => {
             Object.entries(customer.items).forEach(([item, target]) => {
                 if (!itemSummary[item]) {
-                    itemSummary[item] = { totalTarget: 0, totalAchieved: 0, totalRemaining: 0, totalValue: 0, customerCount: 0 };
+                    itemSummary[item] = { totalTarget: 0, totalAchieved: 0, totalRemaining: 0, totalValue: 0, customerCount: 0, achievedCustomerCount: 0 };
                 }
                 const achieved = invoices
                     .filter(inv =>
@@ -1421,6 +1453,7 @@ function showFilteredPopup() {
                 itemSummary[item].totalRemaining += Number(target) - achieved;
                 itemSummary[item].totalValue += value;
                 itemSummary[item].customerCount += 1;
+                if (achieved > 0) itemSummary[item].achievedCustomerCount += 1;
             });
         });
 
@@ -1429,6 +1462,7 @@ function showFilteredPopup() {
                 <tr>
                     <th class="border p-2">Item</th>
                     <th class="border p-2">Customers</th>
+                    <th class="border p-2">Chali Gai</th>
                     <th class="border p-2">Target</th>
                     <th class="border p-2">Achieved</th>
                     <th class="border p-2">Remaining</th>
@@ -1459,6 +1493,7 @@ if (
             popupRows += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:text-sm">
                 <td class="border p-1 sm:p-2">${item}</td>
                 <td class="border p-1 sm:p-2">${data.customerCount}</td>
+                <td class="border p-1 sm:p-2">${data.achievedCustomerCount}</td>
                 <td class="border p-1 sm:p-2">${data.totalTarget}</td>
                 <td class="border p-1 sm:p-2">${data.totalAchieved}</td>
                 <td class="border p-1 sm:p-2">${data.totalRemaining}</td>
@@ -1467,6 +1502,7 @@ if (
             </tr>`;
 
             totalItems++;
+            totalAchievedCustomers += data.achievedCustomerCount;
             totalTarget += data.totalTarget;
             totalAchieved += data.totalAchieved;
             totalRemaining += data.totalRemaining;
@@ -1587,7 +1623,7 @@ if (
     <tr class="bg-indigo-100 font-bold text-xs sm:text-sm">
         <td class="border p-2 text-center">TOTAL</td>
         <td class="border p-2 text-center">${totalItems}</td>
-
+        <td class="border p-2 text-center">${totalAchievedCustomers}</td>
         <td class="border p-2">${totalTarget}</td>
         <td class="border p-2">${totalAchieved}</td>
         <td class="border p-2">${totalRemaining}</td>
