@@ -329,7 +329,7 @@ document.getElementById("dashboardContainer").innerHTML = `
   </button>
 
   <!-- Reset Excel -->
-  <button hidden
+  <button 
     onclick="showResetExcelModal()" 
     class="bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 
            text-white font-semibold px-7 py-3 rounded-2xl shadow-lg transition-all duration-300 
@@ -775,7 +775,7 @@ modal.addEventListener('click', (e) => {
   </div>
 
 
- <div class="mb-4 bg-white rounded-xl shadow p-4">
+   <div class="mb-4 bg-white rounded-xl shadow p-4">
     <h3 class="font-bold text-gray-800 mb-3">Manual Sale Entry</h3>
 
     <div class="grid grid-cols-1 sm:grid-cols-5 gap-3">
@@ -798,11 +798,10 @@ modal.addEventListener('click', (e) => {
                type="date"
                class="border rounded-lg px-3 py-2">
 
-       <button onclick="addManualSale()"
-        disabled
-        class="bg-gray-400 cursor-not-allowed text-white font-semibold rounded-lg px-4 py-2">
-    Add Sale
-</button>
+        <button onclick="addManualSale()"
+                class="bg-yellow-600 hover:bg-yellow-700 text-white font-semibold rounded-lg px-4 py-2">
+            Add Sale
+        </button>
     </div>
 </div>
 
