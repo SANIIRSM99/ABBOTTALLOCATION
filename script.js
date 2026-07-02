@@ -1074,7 +1074,7 @@ function showMainPage() {
     document.getElementById('navMySale')?.classList.remove('bg-yellow-600', 'text-white');
 
     renderInvoiceTable();
-    setTimeout(showStartupSyncPrompt, 450);
+    setTimeout(showStartupSyncPrompt, 60);
 }
 
 function showAllocationPage() {
@@ -1183,6 +1183,7 @@ function login() {
         passwordInput.value = '';
         initSidebarNav();
         renderInvoiceTable();
+        setTimeout(showStartupSyncPrompt, 60);
     } else {
         loginError.classList.remove('hidden');
         loginError.textContent = 'Invalid credentials!';
@@ -1457,7 +1458,7 @@ if (
 
             rowsHtml += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:text-sm">
                 <td class="border p-1 sm:p-2"></td>
-                <td class="border p-1 sm:p-2">${data.achievedCustomerCount} Chali Gai</td>
+                <td class="border p-1 sm:p-2">${data.achievedCustomerCount} Productivity</td>
                 <td class="border p-1 sm:p-2">${data.customerCount} Customers</td>
                 <td class="border p-1 sm:p-2">${item}</td>
                 <td class="border p-1 sm:p-2">${data.totalTargetQty.toLocaleString()}</td>
@@ -1755,7 +1756,7 @@ function showFilteredPopup() {
                 <tr>
                     <th class="border p-2">Item</th>
                     <th class="border p-2">Customers</th>
-                    <th class="border p-2">Chali Gai</th>
+                    <th class="border p-2">Productivity</th>
                     <th class="border p-2">Target</th>
                     <th class="border p-2">Achieved</th>
                     <th class="border p-2">Remaining</th>
@@ -3296,7 +3297,7 @@ function renderMySaleTable() {
 
   const rows = getMySaleRowsForSelectedDateRange();
   const companyMap = {};
-  const dateMap = {};
+  const dateCompanyMap = {};
   let grandTotal = 0;
 
   rows.map(normalizeSaleRecord).forEach(sale => {
@@ -3308,15 +3309,16 @@ function renderMySaleTable() {
     companyMap[companyKey].value += value;
 
     const dateKey = normalizeDateValue(sale.date) || "No Date";
-    if (!dateMap[dateKey]) dateMap[dateKey] = { date: dateKey, value: 0, companies: new Set() };
-    dateMap[dateKey].value += value;
-    dateMap[dateKey].companies.add(company);
+    const dateCompanyKey = `${dateKey}||${company}`;
+    if (!dateCompanyMap[dateCompanyKey]) dateCompanyMap[dateCompanyKey] = { date: dateKey, company, value: 0 };
+    dateCompanyMap[dateCompanyKey].value += value;
     grandTotal += value;
   });
 
   const companyRows = Object.values(companyMap)
     .sort((a, b) => (a.summary || "").localeCompare(b.summary || "", undefined, { numeric: true }) || a.company.localeCompare(b.company));
-  const dateRows = Object.values(dateMap).sort((a, b) => a.date.localeCompare(b.date));
+  const dateRows = Object.values(dateCompanyMap)
+    .sort((a, b) => a.date.localeCompare(b.date) || a.company.localeCompare(b.company));
 
   if (companyTbody) {
     companyTbody.innerHTML = companyRows.length
@@ -3332,8 +3334,8 @@ function renderMySaleTable() {
     dateTbody.innerHTML = dateRows.length
       ? dateRows.map(row => `<tr>
           <td class="border p-2">${escapeHtml(row.date)}</td>
+          <td class="border p-2">${escapeHtml(row.company)}</td>
           <td class="border p-2 text-right font-semibold">${formatNumber(row.value)}</td>
-          <td class="border p-2 text-center">${formatNumber(row.companies.size)}</td>
         </tr>`).join("")
       : `<tr><td colspan="3" class="text-center p-3 text-gray-500">No date wise sale found</td></tr>`;
   }
@@ -3348,10 +3350,10 @@ function formatNumber(n){ return Number(n).toLocaleString(); }
 function escapeHtml(s){ return (s===undefined || s===null) ? "" : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function getMonthStartToTodayRange() {
   const now = new Date();
-  const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
+  const today = formatLocalDateInput(now);
   return {
-    from: formatLocalDateInput(firstDay),
-    to: formatLocalDateInput(now)
+    from: today,
+    to: today
   };
 }
 function formatLocalDateInput(date) {
@@ -3363,10 +3365,8 @@ function setupMySaleDateInputs() {
   const toEl = document.getElementById("mySaleDateTo");
   const defaults = getMonthStartToTodayRange();
   if (!fromEl || !toEl) return defaults;
-  if (!fromEl.value) fromEl.value = localStorage.getItem("mySaleDateFrom") || defaults.from;
-  if (!toEl.value) toEl.value = localStorage.getItem("mySaleDateTo") || defaults.to;
-  localStorage.setItem("mySaleDateFrom", fromEl.value);
-  localStorage.setItem("mySaleDateTo", toEl.value);
+  if (!fromEl.value) fromEl.value = defaults.from;
+  if (!toEl.value) toEl.value = defaults.to;
   return { from: fromEl.value, to: toEl.value };
 }
 function getMySaleRowsForSelectedDateRange() {
