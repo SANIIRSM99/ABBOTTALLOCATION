@@ -1074,7 +1074,6 @@ function showMainPage() {
     document.getElementById('navMySale')?.classList.remove('bg-yellow-600', 'text-white');
 
     renderInvoiceTable();
-    setTimeout(showStartupSyncPrompt, 60);
 }
 
 function showAllocationPage() {
@@ -1183,7 +1182,6 @@ function login() {
         passwordInput.value = '';
         initSidebarNav();
         renderInvoiceTable();
-        setTimeout(showStartupSyncPrompt, 60);
     } else {
         loginError.classList.remove('hidden');
         loginError.textContent = 'Invalid credentials!';
@@ -3295,24 +3293,31 @@ function renderMySaleTable() {
   const legacyTotalEl = salePage.querySelector("#mySaleTotal");
   setupMySaleDateInputs();
 
-  const rows = getMySaleRowsForSelectedDateRange();
+  const companyRowsSource = getMySaleRowsFromMonthStartToToday();
+  const dateRowsSource = getMySaleRowsForSelectedDateRange();
   const companyMap = {};
   const dateCompanyMap = {};
-  let grandTotal = 0;
+  let companyGrandTotal = 0;
+  let dateGrandTotal = 0;
 
-  rows.map(normalizeSaleRecord).forEach(sale => {
+  companyRowsSource.map(normalizeSaleRecord).forEach(sale => {
     const value = Number(sale.value) || 0;
     const summary = sale.summary || "";
     const company = sale.company || "Unknown Company";
     const companyKey = `${summary}||${company}`;
     if (!companyMap[companyKey]) companyMap[companyKey] = { summary, company, value: 0 };
     companyMap[companyKey].value += value;
+    companyGrandTotal += value;
+  });
 
+  dateRowsSource.map(normalizeSaleRecord).forEach(sale => {
+    const value = Number(sale.value) || 0;
+    const company = sale.company || "Unknown Company";
     const dateKey = normalizeDateValue(sale.date) || "No Date";
     const dateCompanyKey = `${dateKey}||${company}`;
     if (!dateCompanyMap[dateCompanyKey]) dateCompanyMap[dateCompanyKey] = { date: dateKey, company, value: 0 };
     dateCompanyMap[dateCompanyKey].value += value;
-    grandTotal += value;
+    dateGrandTotal += value;
   });
 
   const companyRows = Object.values(companyMap)
@@ -3340,9 +3345,9 @@ function renderMySaleTable() {
       : `<tr><td colspan="3" class="text-center p-3 text-gray-500">No date wise sale found</td></tr>`;
   }
 
-  if (companyTotalEl) companyTotalEl.textContent = formatNumber(grandTotal);
-  if (dateTotalEl) dateTotalEl.textContent = formatNumber(grandTotal);
-  if (legacyTotalEl) legacyTotalEl.textContent = formatNumber(grandTotal);
+  if (companyTotalEl) companyTotalEl.textContent = formatNumber(companyGrandTotal);
+  if (dateTotalEl) dateTotalEl.textContent = formatNumber(dateGrandTotal);
+  if (legacyTotalEl) legacyTotalEl.textContent = formatNumber(companyGrandTotal);
 }
 
 // small helpers
@@ -3360,6 +3365,10 @@ function formatLocalDateInput(date) {
   const local = new Date(date.getTime() - (date.getTimezoneOffset() * 60000));
   return local.toISOString().slice(0, 10);
 }
+function getMonthStartDateInput() {
+  const now = new Date();
+  return formatLocalDateInput(new Date(now.getFullYear(), now.getMonth(), 1));
+}
 function setupMySaleDateInputs() {
   const fromEl = document.getElementById("mySaleDateFrom");
   const toEl = document.getElementById("mySaleDateTo");
@@ -3371,8 +3380,15 @@ function setupMySaleDateInputs() {
 }
 function getMySaleRowsForSelectedDateRange() {
   const range = setupMySaleDateInputs();
-  const fromTime = range.from ? Date.parse(range.from) : -Infinity;
-  const toTime = range.to ? Date.parse(range.to) : Infinity;
+  return getMySaleRowsForDateRange(range.from, range.to);
+}
+function getMySaleRowsFromMonthStartToToday() {
+  const defaults = getMonthStartToTodayRange();
+  return getMySaleRowsForDateRange(getMonthStartDateInput(), defaults.to);
+}
+function getMySaleRowsForDateRange(from, to) {
+  const fromTime = from ? Date.parse(from) : -Infinity;
+  const toTime = to ? Date.parse(to) : Infinity;
   return (mySaleData || []).filter(sale => {
     const date = normalizeDateValue(sale.date);
     if (!date) return true;
@@ -4043,6 +4059,28 @@ function showStartupSyncPrompt() {
       syncMySaleFromFirebase?.(finish);
     });
   });
+}
+
+function showLegalPage(page) {
+  const modal = document.getElementById("legalModal");
+  if (!modal) return;
+  const sections = {
+    terms: document.getElementById("legalTerms"),
+    privacy: document.getElementById("legalPrivacy"),
+    about: document.getElementById("legalAbout")
+  };
+  Object.values(sections).forEach(section => section?.classList.add("hidden"));
+  const active = sections[page] || sections.terms;
+  active?.classList.remove("hidden");
+  const title = document.getElementById("legalModalTitle");
+  if (title) {
+    title.textContent = page === "privacy" ? "Privacy Policy" : page === "about" ? "About Me" : "Terms and Conditions";
+  }
+  modal.classList.remove("hidden");
+}
+
+function closeLegalPage() {
+  document.getElementById("legalModal")?.classList.add("hidden");
 }
 
 /* ================================================================
