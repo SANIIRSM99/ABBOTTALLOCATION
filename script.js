@@ -93,11 +93,16 @@ function processCSV(text, onDone) {
     );
 
     const logged = getLoggedUser();
-    const filtered = logged
+    const loggedUpper = (logged || "").toString().trim().toUpperCase();
+    const activeCsvUser = getActiveDataUser();
+    const filterUser = loggedUpper === "ADMIN"
+        ? (activeCsvUser && activeCsvUser !== "ADMIN" && activeCsvUser !== "ALL" ? activeCsvUser : "")
+        : loggedUpper;
+    const filtered = filterUser
         ? rows.filter(
               (r) =>
-                  (r[6] || "").toString().trim().toUpperCase() === logged.toUpperCase() ||
-                  (r[7] || "").toString().trim().toUpperCase() === logged.toUpperCase()
+                  (r[6] || "").toString().trim().toUpperCase() === filterUser ||
+                  (r[7] || "").toString().trim().toUpperCase() === filterUser
           )
         : rows;
 
@@ -118,22 +123,24 @@ function processCSV(text, onDone) {
         Date: row[13] || "",
         ItemRate: parseFloat((row[14] || "0").replace(/,/g, "")) || 0
     });
-    const mappedAllRows = rows.map(mapMainRow);
-    const mapped = filtered.map(mapMainRow);
-    bookerRankSourceRows = getDateFilteredRows(mappedAllRows);
-    localStorage.setItem("bookerRankSourceRows", JSON.stringify(bookerRankSourceRows));
+    let mappedAllRows = rows.map(mapMainRow);
+    let mapped = filtered.map(mapMainRow);
+    const previousAllRows = JSON.parse(localStorage.getItem("excelDataAll") || "[]");
+    const previousVisibleRows = JSON.parse(localStorage.getItem("excelData") || "[]");
+    if (typeof mergeCsvRowsKeepTargets === "function") {
+        mappedAllRows = mergeCsvRowsKeepTargets(previousAllRows, mappedAllRows);
+        mapped = filterUser ? filterRowsForUser(mappedAllRows, filterUser) : mergeCsvRowsKeepTargets(previousVisibleRows, mapped);
+    }
 
     console.log("✅ Total CSV Rows:", lines.length);
     console.log("✅ Filtered Rows (after user filter):", filtered.length);
     console.log("✅ Final Mapped Rows:", mapped.length);
 
-    fullExcelData = mapped;
-    localStorage.setItem("excelDataAll", JSON.stringify(mapped));
-    const visibleMapped = getDateFilteredRows(mapped);
-    allCSVData = visibleMapped; // Save filtered rows for the current dashboard date range
+    localStorage.setItem("excelDataAll", JSON.stringify(mappedAllRows));
+    allCSVData = mapped; // Save visible rows globally
 
     // ✅ Invoices = Achieve > 0 rows
-    invoices = visibleMapped
+    invoices = mapped
         .filter((r) => r.CustomerCode && r.Item1)
         .map((r) => ({
             city: r.City,
@@ -150,7 +157,7 @@ function processCSV(text, onDone) {
 
     // ✅ Bonus Deals
     bonusDeals = {};
-    visibleMapped.forEach((row) => {
+    mapped.forEach((row) => {
         const item = row.Item1;
         if (!item) return;
         if (!bonusDeals[item]) bonusDeals[item] = [];
@@ -160,16 +167,15 @@ function processCSV(text, onDone) {
     });
     localStorage.setItem("bonusDeals", JSON.stringify(bonusDeals));
 
-    syncMySaleFromFirebase();
-
     // ✅ Render updates
-    if (typeof renderInvoiceTable === "function") renderInvoiceTable(visibleMapped);
+    if (typeof renderInvoiceTable === "function") renderInvoiceTable(mapped);
     if (typeof renderMySaleTable === "function") renderMySaleTable();
 
-   if (onDone) onDone(visibleMapped);
+   if (onDone) onDone(mapped);
 
 // ✅ Create a unique hash from current data to detect duplicate uploads
-const currentHash = btoa(JSON.stringify(mapped)).slice(0, 100);
+const uploadRows = loggedUpper === "ADMIN" ? mappedAllRows : mapped;
+const currentHash = btoa(JSON.stringify(uploadRows)).slice(0, 100);
 const lastMeta = JSON.parse(localStorage.getItem("lastCsvMeta") || "{}");
 const loggedUser = getLoggedUser() || "UNKNOWN_USER";
 
@@ -191,7 +197,7 @@ if (lastMeta.hash === currentHash && lastMeta.user === loggedUser) {
   }));
 
   // ✅ Upload processed data to Realtime DB
-  saveCSVToFirebase(mapped);
+  saveCSVToFirebase(uploadRows);
 
   // ✅ Optional: upload raw file (only if available)
   try {
@@ -220,14 +226,15 @@ let customerTargets = {};
 let isLoggedIn = false;
 let bonusDeals = {};
 let lastRenderedCustomerCode = null;
-let fullExcelData = [];
-let bookerRankSourceRows = [];
 
 function getActiveDataUser() {
   const logged = (getLoggedUser() || "").toString().trim().toUpperCase();
-  if (logged && logged !== "ADMIN") {
-    localStorage.setItem("activeDataUser", logged);
-    return logged;
+  if (logged === "ADMIN" && typeof document !== "undefined") {
+    const selected = (document.getElementById("userSelect")?.value || "").toString().trim().toUpperCase();
+    if (selected) {
+      localStorage.setItem("activeDataUser", selected);
+      return selected;
+    }
   }
   return (localStorage.getItem("activeDataUser") || logged || "").toString().trim().toUpperCase();
 }
@@ -238,74 +245,425 @@ function setActiveDataUser(user) {
   return clean;
 }
 
-function normalizeDateValue(value) {
-  const raw = (value || "").toString().trim();
-  if (!raw) return "";
-  const parsed = Date.parse(raw);
-  if (!isNaN(parsed)) return new Date(parsed).toISOString().slice(0, 10);
-  const parts = raw.split(/[\/\-\.]/).map(part => part.trim());
-  if (parts.length === 3) {
-    const [a, b, c] = parts;
-    if (c.length === 4) {
-      const day = a.padStart(2, "0");
-      const month = b.padStart(2, "0");
-      const iso = `${c}-${month}-${day}`;
-      if (!isNaN(Date.parse(iso))) return iso;
+/**
+ * Save processed CSV rows (mapped array) online.
+ * Uses: 1) if window.FIREBASE_UPLOAD_ENDPOINT set -> POST there
+ *       2) else if DATABASE_URL set -> upload to Firebase Realtime DB via REST
+ *       3) else -> fallback: save to localStorage and console.warn
+ *
+ * Expects `data` = array of objects (mapped rows)
+ */
+
+
+function saveCSVToFirebase(data) {
+  try {
+    if (!data) return;
+    const loggedUser = getLoggedUser();
+    if (!loggedUser) {
+      console.warn("⚠️ No logged-in user — saving locally instead.");
+      localStorage.setItem("excelData", JSON.stringify(data));
+      return;
     }
+
+    const payload = {
+      uploadedAt: new Date().toISOString(),
+      uploadedBy: getLoggedUser() || loggedUser,
+      rows: data
+    };
+
+
+    const targetUploadUser = getActiveDataUser() || loggedUser.toUpperCase();
+    const url = `${DATABASE_URL}/csvUploads/${targetUploadUser}/latest.json`;
+
+    fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+      .then(res => {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        console.log("✅ Firebase updated successfully!");
+      })
+      .catch(err => {
+        console.error("❌ Upload failed:", err);
+        localStorage.setItem("excelData", JSON.stringify(data));
+      });
+  } catch (err) {
+    console.error("❌ saveCSVToFirebase error:", err);
   }
-  return "";
 }
 
-function getDefaultDateRange() {
-  const today = new Date();
-  const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-  return {
-    from: firstDay.toISOString().slice(0, 10),
-    to: today.toISOString().slice(0, 10)
-  };
-}
+async function deleteUserData(userToDelete) {
+    const loggedUser = getLoggedUser();
 
-function ensureDateFilterDefaults() {
-  const defaults = getDefaultDateRange();
-  if (!localStorage.getItem("dashboardDateFrom")) localStorage.setItem("dashboardDateFrom", defaults.from);
-  if (!localStorage.getItem("dashboardDateTo")) localStorage.setItem("dashboardDateTo", defaults.to);
-}
-
-function getDateFilteredRows(rows) {
-  return rows || [];
-}
-
-function aggregateMySaleFromRows(rows) {
-  const saleMap = {};
-  (rows || []).forEach(row => {
-    const summary = (row.SummaryNumber || row.summary || "").toString().trim();
-    if (!summary) return;
-    const value = Number(row.Value ?? row.value ?? 0) || 0;
-    if (!saleMap[summary]) {
-      saleMap[summary] = {
-        summary,
-        company: row.CompanyName || row.company || "",
-        value: 0,
-        date: row.Date || row.date || ""
-      };
+    if (!loggedUser) {
+        alert("No logged in user!");
+        return;
     }
-    saleMap[summary].value += value;
-    saleMap[summary].company = row.CompanyName || row.company || saleMap[summary].company;
-    saleMap[summary].date = pickLatestDate(saleMap[summary].date, row.Date || row.date || "");
-  });
-  return Object.values(saleMap);
+
+    if (loggedUser.toUpperCase() !== "ADMIN") {
+        alert("Only ADMIN can delete data!");
+        return;
+    }
+
+    userToDelete = (userToDelete || "").toString().trim().toUpperCase();
+    if (!userToDelete || userToDelete === "ADMIN") {
+        alert("Please select a valid user to delete.");
+        return;
+    }
+
+    const isAllDelete = userToDelete === "ALL";
+    const confirmText = isAllDelete
+        ? "Are you sure you want to DELETE ALL Firebase data for every user/booker? This will delete central data, user wise data, and My Sale data."
+        : `Are you sure you want to DELETE all Firebase data of: ${userToDelete}?`;
+
+    if (!confirm(confirmText)) {
+        return;
+    }
+
+    try {
+        const paths = isAllDelete
+            ? [
+                `${DATABASE_URL}/csvUploads.json`,
+                `${DATABASE_URL}/mySales.json`
+            ]
+            : [
+                `${DATABASE_URL}/csvUploads/${userToDelete}.json`,
+                `${DATABASE_URL}/mySales/${userToDelete}.json`,
+                `${DATABASE_URL}/csvUploads/${userToDelete}/mySales.json`
+            ];
+        const results = await Promise.all(paths.map(url => fetch(url, { method: "DELETE" })));
+        const failed = results.find(res => !res.ok);
+        if (failed) throw new Error("Failed: " + failed.status);
+
+        if (!isAllDelete) {
+            await removeUserRowsFromAllUpload(userToDelete);
+        }
+
+        if (isAllDelete || getActiveDataUser() === userToDelete) {
+            excelData = [];
+            invoices = [];
+            mySaleData = [];
+            localStorage.removeItem("excelData");
+            localStorage.removeItem("excelDataAll");
+            localStorage.removeItem("invoices");
+            localStorage.removeItem("mySaleData");
+            localStorage.removeItem("lastCsvUploadRef");
+            buildCustomerTargets();
+            renderInvoiceTable();
+            renderMySaleTable?.();
+        }
+        showAppNotification(isAllDelete ? "All Firebase data deleted successfully." : `Firebase data deleted for ${userToDelete}.`, "success");
+    } catch (err) {
+        console.error("Delete error:", err);
+        showAppNotification("Error deleting data from Firebase.", "error");
+    }
 }
 
-function setupDateRangeControls() {
-  return;
+async function removeUserRowsFromAllUpload(userToDelete) {
+    try {
+        if (typeof DATABASE_URL !== "string" || !DATABASE_URL) return;
+        const cleanUser = (userToDelete || "").toString().trim().toUpperCase();
+        if (!cleanUser || cleanUser === "ALL" || cleanUser === "ADMIN") return;
+
+        const url = `${DATABASE_URL}/csvUploads/ALL/latest.json`;
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const payload = await res.json();
+        if (!payload || !Array.isArray(payload.rows)) return;
+
+        const keptRows = payload.rows.filter(row => {
+            const user1 = (row.User1 || row.user1 || row.USER || row.user || "").toString().trim().toUpperCase();
+            const user2 = (row.User2 || row.user2 || "").toString().trim().toUpperCase();
+            return user1 !== cleanUser && user2 !== cleanUser;
+        });
+
+        if (keptRows.length === payload.rows.length) return;
+        const updatedPayload = {
+            ...payload,
+            rows: keptRows,
+            updatedAt: new Date().toISOString(),
+            updatedBy: getLoggedUser() || "ADMIN"
+        };
+
+        await fetch(url, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(updatedPayload)
+        });
+    } catch (err) {
+        console.warn("Could not remove user rows from ALL upload:", err);
+    }
+}
+document.addEventListener("DOMContentLoaded", () => {
+    const btn = document.getElementById("deleteUserBtn");
+    if (!btn) return;
+
+    btn.addEventListener("click", () => {
+        const user = document.getElementById("userSelect").value;
+        deleteUserData(user);
+    });
+});
+
+
+
+
+
+function syncUserDataFromFirebase(onDone) {
+  const loggedUser = getLoggedUser();
+  if (!loggedUser) {
+    console.warn('No logged-in user. Cannot sync data.');
+    if (onDone) onDone([]);
+    return;
+  }
+
+  if (typeof DATABASE_URL !== 'string' || DATABASE_URL.length === 0) {
+    console.warn('No Firebase DATABASE_URL configured. Using local data.');
+    const localData = JSON.parse(localStorage.getItem('excelData') || '[]');
+    processCSVData(localData, onDone);
+    return;
+  }
+
+  const userPath = `csvUploads/${loggedUser.toUpperCase()}`;
+  const url = `${DATABASE_URL}/${userPath}.json`;
+
+  fetch(url)
+    .then(res => {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(data => {
+      let allRows = [];
+      if (data) {
+        // Flatten all uploads for the user
+        Object.values(data).forEach(upload => {
+          if (upload.rows && Array.isArray(upload.rows)) {
+            allRows = allRows.concat(upload.rows);
+          }
+        });
+      }
+      console.log(`✅ Fetched ${allRows.length} rows for user ${loggedUser}`);
+      processCSVData(allRows, onDone);
+    })
+    .catch(err => {
+      console.error('❌ Failed to fetch user data from Firebase:', err);
+      const localData = JSON.parse(localStorage.getItem('excelData') || '[]');
+      processCSVData(localData, onDone);
+    });
 }
 
-function applyDashboardDateFilter() {
-  return;
+
+
+
+function buildCustomerTargets() {
+    console.log('Building customer targets from excelData:', excelData);
+    customerTargets = {};
+    customers = [];
+    customerCodes = [];
+    items = [];
+    bonusDeals = {};
+    
+    excelData.forEach(row => {
+        const customerCode = (row.CustomerCode || '').trim().toUpperCase();
+        const customer = (row.Customer || '').trim();
+        const city = (row.City || '').trim();
+        const item = (row.Item1 || '').trim().toUpperCase();
+        const target = Number(row.Target1 || 0);
+        const dealQty = row.DealQty;
+        const dealBonus = row.DealBonus;
+
+        if (!customer || !customerCode || !city) {
+            console.warn('Skipping row due to missing customer data:', row);
+            return;
+        }
+        if (!customerCodes.includes(customerCode)) {
+            customerCodes.push(customerCode);
+            customers.push({ code: customerCode, name: customer, city: city });
+        }
+        if (!customerTargets[customerCode]) {
+            customerTargets[customerCode] = { name: customer, city: city, items: {} };
+        }
+        if (item && target >= 0) {
+            customerTargets[customerCode].items[item] = (customerTargets[customerCode].items[item] || 0) + target;
+            if (!items.includes(item)) items.push(item);
+        }
+
+        if (item && dealQty > 0 && dealBonus > 0) {
+            if (!bonusDeals[item]) bonusDeals[item] = [];
+            bonusDeals[item].push({ qty: dealQty, bonus: dealBonus });
+        }
+    });
+
+    console.log('Customer targets built:', customerTargets);
+    console.log('Items extracted:', items);
+    console.log('Bonus deals built:', bonusDeals);
+    localStorage.setItem('items', JSON.stringify(items));
+    localStorage.setItem('customers', JSON.stringify(customers));
+    localStorage.setItem('customerCodes', JSON.stringify(customerCodes));
+    localStorage.setItem('bonusDeals', JSON.stringify(bonusDeals));
+    updateCityDropdown();
+    renderBonusDeals();
+    populateBonusItems();
 }
 
-function resetDashboardDateFilter() {
-  return;
+function updateCityDropdown() {
+    const citySelect = document.getElementById('citySelect');
+    if (!citySelect) return;
+    const cities = [...new Set(excelData.map(row => row.City?.trim()))].filter(city => city);
+    console.log('Cities for dropdown:', cities);
+    citySelect.innerHTML = '<option value="">Select a city</option>';
+    cities.forEach(city => {
+        const option = document.createElement('option');
+        option.value = city;
+        option.textContent = city;
+        citySelect.appendChild(option);
+    });
+}
+
+function generateUnlockCode() {
+    const randomCode = Math.floor(100000 + Math.random() * 900000);
+    localStorage.setItem('displayCode', randomCode);
+    const finalCode = (randomCode * 2) + 985973;
+    return finalCode;
+}
+
+function checkLockStatus() {
+    const codeSection = document.getElementById('codeSection');
+    const loginPage = document.getElementById('loginPage');
+    const mainPage = document.getElementById('mainPage');
+    const sidebar = document.getElementById('sidebar');
+    const hamburgerContainer = document.getElementById('hamburgerContainer');
+    const displayCodeElement = document.getElementById('displayCode');
+
+    if (!codeSection || !displayCodeElement || !loginPage || !mainPage || !sidebar || !hamburgerContainer) {
+        console.error('Critical DOM elements missing:', { codeSection, displayCodeElement, loginPage, mainPage, sidebar, hamburgerContainer });
+        return;
+    }
+
+    codeSection.classList.add('fixed', 'top-1/2', 'left-1/2', 'transform', '-translate-x-1/2', '-translate-y-1/2', 'z-50', 'bg-white', 'p-6', 'rounded-lg', 'shadow-lg', 'w-80', 'max-w-[90%]');
+
+    let overlay = document.getElementById('lockOverlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'lockOverlay';
+        overlay.classList.add('fixed', 'inset-0', 'bg-black', 'bg-opacity-50', 'z-40', 'hidden');
+        document.body.appendChild(overlay);
+    }
+
+    const today = new Date();
+    const currentYearMonth = `${today.getFullYear()}-${today.getMonth() + 1}`;
+    const lastUnlockMonth = localStorage.getItem('lastUnlockMonth');
+    const isNewDevice = !localStorage.getItem('deviceInitialized');
+    const isFirstOfMonth = today.getDate() === 1;
+    const storedIsAppLocked = localStorage.getItem('isAppLocked') === 'true';
+
+    // Initialize device on first run
+    if (isNewDevice) {
+        localStorage.setItem('deviceInitialized', 'true');
+        localStorage.setItem('isAppLocked', 'true');
+    }
+
+    // Check if app should be locked
+    if (isNewDevice || (isFirstOfMonth && lastUnlockMonth !== currentYearMonth) || storedIsAppLocked) {
+        isAppLocked = true;
+        localStorage.setItem('isAppLocked', 'true');
+        unlockCode = generateUnlockCode();
+        localStorage.setItem('unlockCode', unlockCode);
+        localStorage.setItem('lastLockCheck', today.toISOString());
+        displayCodeElement.textContent = localStorage.getItem('displayCode');
+        codeSection.classList.remove('hidden');
+        overlay.classList.remove('hidden');
+        loginPage.classList.add('hidden');
+        mainPage.classList.add('hidden');
+        sidebar.classList.add('hidden', '-translate-x-full');
+        hamburgerContainer.classList.add('hidden');
+        console.log('Lock popup shown with code:', localStorage.getItem('displayCode'));
+    } else {
+        isAppLocked = false;
+        localStorage.setItem('isAppLocked', 'false');
+        codeSection.classList.add('hidden');
+        overlay.classList.add('hidden');
+        const loggedUser = getLoggedUser();
+        if (loggedUser) {
+            isLoggedIn = true;
+            loginPage.classList.add('hidden');
+            mainPage.classList.remove('hidden');
+            sidebar.classList.add('md:block');
+            hamburgerContainer.classList.remove('hidden');
+            initSidebarNav();
+            renderInvoiceTable();
+        } else {
+            loginPage.classList.remove('hidden');
+            mainPage.classList.add('hidden');
+            sidebar.classList.add('hidden', '-translate-x-full');
+            hamburgerContainer.classList.add('hidden');
+        }
+        console.log('App is unlocked, showing login or main page');
+    }
+}
+
+function unlockApp() {
+    const unlockCodeInput = document.getElementById('unlockCode');
+    const codeError = document.getElementById('codeError');
+    const codeSection = document.getElementById('codeSection');
+    const overlay = document.getElementById('lockOverlay');
+    if (!unlockCodeInput || !codeError || !codeSection || !overlay) {
+        console.error('Unlock DOM elements missing:', { unlockCodeInput, codeError, codeSection, overlay });
+        return;
+    }
+
+    const enteredCode = unlockCodeInput.value.trim();
+    const storedUnlockCode = parseInt(localStorage.getItem('unlockCode'));
+
+    // ✅ Admin Master Code
+    const adminCode = "123ND";
+
+    if (enteredCode === adminCode || parseInt(enteredCode) === storedUnlockCode) {
+        isAppLocked = false;
+        localStorage.setItem('isAppLocked', 'false');
+        const today = new Date();
+        const currentYearMonth = `${today.getFullYear()}-${today.getMonth() + 1}`;
+        localStorage.setItem('lastUnlockMonth', currentYearMonth);
+        localStorage.removeItem('unlockCode');
+        localStorage.removeItem('displayCode');
+        localStorage.setItem('lastLockCheck', today.toISOString());
+        codeSection.classList.add('hidden');
+        overlay.classList.add('hidden');
+        document.getElementById('loginPage').classList.remove('hidden');
+        codeError.classList.add('hidden');
+        unlockCodeInput.value = '';
+        console.log('✅ App unlocked successfully for month:', currentYearMonth);
+    } else {
+        codeError.classList.remove('hidden');
+        console.error('❌ Invalid unlock code entered:', enteredCode);
+    }
+}
+
+
+function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar) {
+        sidebar.classList.toggle('hidden');
+        sidebar.classList.toggle('-translate-x-full');
+    }
+}
+
+function initSidebarNav() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) {
+        console.error('Sidebar element not found');
+        return;
+    }
+    const buttons = sidebar.querySelectorAll('button');
+    buttons.forEach(button => {
+        button.removeEventListener('click', handleSidebarClick);
+        button.addEventListener('click', handleSidebarClick);
+    });
+    const loggedUserName = getLoggedUser();
+    const userNameEls = document.querySelectorAll('#loggedUserName');
+    userNameEls.forEach(el => {
+        el.textContent = loggedUserName || 'User';
+    });
 }
 
 function safeTargetInputId(customerCode, item) {
@@ -333,15 +691,16 @@ async function saveRowsToFirebaseUser(rows, user) {
   });
 }
 
-async function saveTargetUpdateToFirebase(customerCode, item) {
-  const rowsByUser = {};
-  (fullExcelData || []).forEach(row => {
+async function saveTargetUpdateToFirebase() {
+  const rows = JSON.parse(localStorage.getItem("excelData") || "[]");
+  const byUser = {};
+  rows.forEach(row => {
     const user = getUserForDataRow(row);
     if (!user || user === "ALL") return;
-    if (!rowsByUser[user]) rowsByUser[user] = [];
-    rowsByUser[user].push(row);
+    if (!byUser[user]) byUser[user] = [];
+    byUser[user].push(row);
   });
-  await Promise.all(Object.entries(rowsByUser).map(([user, rows]) => saveRowsToFirebaseUser(rows, user)));
+  await Promise.all(Object.entries(byUser).map(([user, userRows]) => saveRowsToFirebaseUser(userRows, user)));
 }
 
 function setTargetForZeroItem(customerCode, item) {
@@ -351,7 +710,7 @@ function setTargetForZeroItem(customerCode, item) {
     alert("Please enter target greater than 0.");
     return;
   }
-  const updateRows = (rows) => (rows || []).map(row => {
+  excelData = (excelData || []).map(row => {
     const code = (row.CustomerCode || "").toString().trim().toUpperCase();
     const rowItem = (row.Item1 || "").toString().trim().toUpperCase();
     if (code === customerCode.toUpperCase() && rowItem === item.toUpperCase()) {
@@ -359,14 +718,10 @@ function setTargetForZeroItem(customerCode, item) {
     }
     return row;
   });
-  fullExcelData = updateRows(fullExcelData.length ? fullExcelData : JSON.parse(localStorage.getItem("excelDataAll") || "[]"));
-  excelData = updateRows(excelData);
-  bookerRankSourceRows = updateRows(bookerRankSourceRows);
-  localStorage.setItem("excelDataAll", JSON.stringify(fullExcelData));
   localStorage.setItem("excelData", JSON.stringify(excelData));
-  localStorage.setItem("bookerRankSourceRows", JSON.stringify(bookerRankSourceRows));
-  saveTargetUpdateToFirebase(customerCode, item);
-  processCSVData(fullExcelData);
+  saveTargetUpdateToFirebase();
+  buildCustomerTargets();
+  renderInvoiceTable();
 }
 
 function applyTargetToAllZeroItems() {
@@ -377,22 +732,18 @@ function applyTargetToAllZeroItems() {
     return;
   }
   let updated = 0;
-  const updateRows = (rows, shouldCount = false) => (rows || []).map(row => {
+  excelData = (excelData || []).map(row => {
     const hasItem = (row.CustomerCode || "").toString().trim() && (row.Item1 || "").toString().trim();
     if (hasItem && Number(row.Target1 || 0) === 0) {
-      if (shouldCount) updated++;
+      updated++;
       return { ...row, Target1: newTarget };
     }
     return row;
   });
-  fullExcelData = updateRows(fullExcelData.length ? fullExcelData : JSON.parse(localStorage.getItem("excelDataAll") || "[]"), true);
-  excelData = updateRows(excelData);
-  bookerRankSourceRows = updateRows(bookerRankSourceRows);
-  localStorage.setItem("excelDataAll", JSON.stringify(fullExcelData));
   localStorage.setItem("excelData", JSON.stringify(excelData));
-  localStorage.setItem("bookerRankSourceRows", JSON.stringify(bookerRankSourceRows));
   saveTargetUpdateToFirebase();
-  processCSVData(fullExcelData);
+  buildCustomerTargets();
+  renderInvoiceTable();
   alert(`Target applied to ${updated} zero target rows.`);
 }
 
@@ -668,6 +1019,7 @@ function getCityWisePivot(report) {
 function renderCityWisePivotRows(report) {
   const pivot = getCityWisePivot(report);
   if (!pivot.items.length) return '<tr><td colspan="9" class="p-2 text-center">No city wise data available.</td></tr>';
+  const colCount = pivot.cities.length + 2;
   let html = `
     <tr class="bg-emerald-100 font-bold text-xs sm:text-sm sticky top-0 z-10">
       <td class="border p-2">ITEM NAME</td>
@@ -728,308 +1080,6 @@ function renderCityWiseRows(report, label = "City Wise") {
       <td class="border p-2">${report.totals.value.toLocaleString()}</td>
     </tr>`;
   return html;
-}
-
-/**
- * Save processed CSV rows (mapped array) online.
- * Uses: 1) if window.FIREBASE_UPLOAD_ENDPOINT set -> POST there
- *       2) else if DATABASE_URL set -> upload to Firebase Realtime DB via REST
- *       3) else -> fallback: save to localStorage and console.warn
- *
- * Expects `data` = array of objects (mapped rows)
- */
-function saveCSVToFirebase(data) {
-  try {
-    if (!data) return;
-    const loggedUser = getLoggedUser();
-    if (!loggedUser) {
-      console.warn("⚠️ No logged-in user — saving locally instead.");
-      localStorage.setItem("excelData", JSON.stringify(data));
-      return;
-    }
-
-    const payload = {
-      uploadedAt: new Date().toISOString(),
-      uploadedBy: getLoggedUser() || loggedUser,
-      rows: data
-    };
-
-    const targetUploadUser = getActiveDataUser() || loggedUser.toUpperCase();
-    const url = `${DATABASE_URL}/csvUploads/${targetUploadUser}/latest.json`;
-
-    fetch(url, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    })
-      .then(res => {
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        console.log("✅ Firebase updated successfully!");
-      })
-      .catch(err => {
-        console.error("❌ Upload failed:", err);
-        localStorage.setItem("excelData", JSON.stringify(data));
-      });
-  } catch (err) {
-    console.error("❌ saveCSVToFirebase error:", err);
-  }
-}
-
-function syncUserDataFromFirebase(onDone) {
-  const loggedUser = getLoggedUser();
-  if (!loggedUser) {
-    console.warn('No logged-in user. Cannot sync data.');
-    if (onDone) onDone([]);
-    return;
-  }
-
-  if (typeof DATABASE_URL !== 'string' || DATABASE_URL.length === 0) {
-    console.warn('No Firebase DATABASE_URL configured. Using local data.');
-    const localData = JSON.parse(localStorage.getItem('excelData') || '[]');
-    processCSVData(localData, onDone);
-    return;
-  }
-
-  const userPath = `csvUploads/${loggedUser.toUpperCase()}`;
-  const url = `${DATABASE_URL}/${userPath}.json`;
-
-  fetch(url)
-    .then(res => {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    })
-    .then(data => {
-      let allRows = [];
-      if (data) {
-        // Flatten all uploads for the user
-        Object.values(data).forEach(upload => {
-          if (upload.rows && Array.isArray(upload.rows)) {
-            allRows = allRows.concat(upload.rows);
-          }
-        });
-      }
-      console.log(`✅ Fetched ${allRows.length} rows for user ${loggedUser}`);
-      processCSVData(allRows, onDone);
-    })
-    .catch(err => {
-      console.error('❌ Failed to fetch user data from Firebase:', err);
-      const localData = JSON.parse(localStorage.getItem('excelData') || '[]');
-      processCSVData(localData, onDone);
-    });
-}
-
-
-
-
-function buildCustomerTargets() {
-    console.log('Building customer targets from excelData:', excelData);
-    customerTargets = {};
-    customers = [];
-    customerCodes = [];
-    items = [];
-    bonusDeals = {};
-    
-    excelData.forEach(row => {
-        const customerCode = (row.CustomerCode || '').trim().toUpperCase();
-        const customer = (row.Customer || '').trim();
-        const city = (row.City || '').trim();
-        const item = (row.Item1 || '').trim().toUpperCase();
-        const target = Number(row.Target1 || 0);
-        const dealQty = row.DealQty;
-        const dealBonus = row.DealBonus;
-
-        if (!customer || !customerCode || !city) {
-            console.warn('Skipping row due to missing customer data:', row);
-            return;
-        }
-        if (!customerCodes.includes(customerCode)) {
-            customerCodes.push(customerCode);
-            customers.push({ code: customerCode, name: customer, city: city });
-        }
-        if (!customerTargets[customerCode]) {
-            customerTargets[customerCode] = { name: customer, city: city, items: {} };
-        }
-        if (item && target >= 0) {
-            customerTargets[customerCode].items[item] = (customerTargets[customerCode].items[item] || 0) + target;
-            if (!items.includes(item)) items.push(item);
-        }
-
-        if (item && dealQty > 0 && dealBonus > 0) {
-            if (!bonusDeals[item]) bonusDeals[item] = [];
-            bonusDeals[item].push({ qty: dealQty, bonus: dealBonus });
-        }
-    });
-
-    console.log('Customer targets built:', customerTargets);
-    console.log('Items extracted:', items);
-    console.log('Bonus deals built:', bonusDeals);
-    localStorage.setItem('items', JSON.stringify(items));
-    localStorage.setItem('customers', JSON.stringify(customers));
-    localStorage.setItem('customerCodes', JSON.stringify(customerCodes));
-    localStorage.setItem('bonusDeals', JSON.stringify(bonusDeals));
-    updateCityDropdown();
-    renderBonusDeals();
-    populateBonusItems();
-}
-
-function updateCityDropdown() {
-    const citySelect = document.getElementById('citySelect');
-    if (!citySelect) return;
-    const cities = [...new Set(excelData.map(row => row.City?.trim()))].filter(city => city);
-    console.log('Cities for dropdown:', cities);
-    citySelect.innerHTML = '<option value="">Select a city</option>';
-    cities.forEach(city => {
-        const option = document.createElement('option');
-        option.value = city;
-        option.textContent = city;
-        citySelect.appendChild(option);
-    });
-}
-
-function generateUnlockCode() {
-    const randomCode = Math.floor(100000 + Math.random() * 900000);
-    localStorage.setItem('displayCode', randomCode);
-    const finalCode = (randomCode * 2) + 985973;
-    return finalCode;
-}
-
-function checkLockStatus() {
-    const codeSection = document.getElementById('codeSection');
-    const loginPage = document.getElementById('loginPage');
-    const mainPage = document.getElementById('mainPage');
-    const sidebar = document.getElementById('sidebar');
-    const hamburgerContainer = document.getElementById('hamburgerContainer');
-    const displayCodeElement = document.getElementById('displayCode');
-
-    if (!codeSection || !displayCodeElement || !loginPage || !mainPage || !sidebar || !hamburgerContainer) {
-        console.error('Critical DOM elements missing:', { codeSection, displayCodeElement, loginPage, mainPage, sidebar, hamburgerContainer });
-        return;
-    }
-
-    codeSection.classList.add('fixed', 'top-1/2', 'left-1/2', 'transform', '-translate-x-1/2', '-translate-y-1/2', 'z-50', 'bg-white', 'p-6', 'rounded-lg', 'shadow-lg', 'w-80', 'max-w-[90%]');
-
-    let overlay = document.getElementById('lockOverlay');
-    if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.id = 'lockOverlay';
-        overlay.classList.add('fixed', 'inset-0', 'bg-black', 'bg-opacity-50', 'z-40', 'hidden');
-        document.body.appendChild(overlay);
-    }
-
-    const today = new Date();
-    const currentYearMonth = `${today.getFullYear()}-${today.getMonth() + 1}`;
-    const lastUnlockMonth = localStorage.getItem('lastUnlockMonth');
-    const isNewDevice = !localStorage.getItem('deviceInitialized');
-    const isFirstOfMonth = today.getDate() === 1;
-    const storedIsAppLocked = localStorage.getItem('isAppLocked') === 'true';
-
-    // Initialize device on first run
-    if (isNewDevice) {
-        localStorage.setItem('deviceInitialized', 'true');
-        localStorage.setItem('isAppLocked', 'true');
-    }
-
-    // Check if app should be locked
-    if (isNewDevice || (isFirstOfMonth && lastUnlockMonth !== currentYearMonth) || storedIsAppLocked) {
-        isAppLocked = true;
-        localStorage.setItem('isAppLocked', 'true');
-        unlockCode = generateUnlockCode();
-        localStorage.setItem('unlockCode', unlockCode);
-        localStorage.setItem('lastLockCheck', today.toISOString());
-        displayCodeElement.textContent = localStorage.getItem('displayCode');
-        codeSection.classList.remove('hidden');
-        overlay.classList.remove('hidden');
-        loginPage.classList.add('hidden');
-        mainPage.classList.add('hidden');
-        sidebar.classList.add('hidden', '-translate-x-full');
-        hamburgerContainer.classList.add('hidden');
-        console.log('Lock popup shown with code:', localStorage.getItem('displayCode'));
-    } else {
-        isAppLocked = false;
-        localStorage.setItem('isAppLocked', 'false');
-        codeSection.classList.add('hidden');
-        overlay.classList.add('hidden');
-        const loggedUser = getLoggedUser();
-        if (loggedUser) {
-            isLoggedIn = true;
-            loginPage.classList.add('hidden');
-            mainPage.classList.remove('hidden');
-            sidebar.classList.add('md:block');
-            hamburgerContainer.classList.remove('hidden');
-            initSidebarNav();
-            renderInvoiceTable();
-        } else {
-            loginPage.classList.remove('hidden');
-            mainPage.classList.add('hidden');
-            sidebar.classList.add('hidden', '-translate-x-full');
-            hamburgerContainer.classList.add('hidden');
-        }
-        console.log('App is unlocked, showing login or main page');
-    }
-}
-
-function unlockApp() {
-    const unlockCodeInput = document.getElementById('unlockCode');
-    const codeError = document.getElementById('codeError');
-    const codeSection = document.getElementById('codeSection');
-    const overlay = document.getElementById('lockOverlay');
-    if (!unlockCodeInput || !codeError || !codeSection || !overlay) {
-        console.error('Unlock DOM elements missing:', { unlockCodeInput, codeError, codeSection, overlay });
-        return;
-    }
-
-    const enteredCode = unlockCodeInput.value.trim();
-    const storedUnlockCode = parseInt(localStorage.getItem('unlockCode'));
-
-    // ✅ Admin Master Code
-    const adminCode = "985973@AbkND";
-
-    if (enteredCode === adminCode || parseInt(enteredCode) === storedUnlockCode) {
-        isAppLocked = false;
-        localStorage.setItem('isAppLocked', 'false');
-        const today = new Date();
-        const currentYearMonth = `${today.getFullYear()}-${today.getMonth() + 1}`;
-        localStorage.setItem('lastUnlockMonth', currentYearMonth);
-        localStorage.removeItem('unlockCode');
-        localStorage.removeItem('displayCode');
-        localStorage.setItem('lastLockCheck', today.toISOString());
-        codeSection.classList.add('hidden');
-        overlay.classList.add('hidden');
-        document.getElementById('loginPage').classList.remove('hidden');
-        codeError.classList.add('hidden');
-        unlockCodeInput.value = '';
-        console.log('✅ App unlocked successfully for month:', currentYearMonth);
-    } else {
-        codeError.classList.remove('hidden');
-        console.error('❌ Invalid unlock code entered:', enteredCode);
-    }
-}
-
-
-function toggleSidebar() {
-    const sidebar = document.getElementById('sidebar');
-    if (sidebar) {
-        sidebar.classList.toggle('hidden');
-        sidebar.classList.toggle('-translate-x-full');
-    }
-}
-
-function initSidebarNav() {
-    const sidebar = document.getElementById('sidebar');
-    if (!sidebar) {
-        console.error('Sidebar element not found');
-        return;
-    }
-    const buttons = sidebar.querySelectorAll('button');
-    buttons.forEach(button => {
-        button.removeEventListener('click', handleSidebarClick);
-        button.addEventListener('click', handleSidebarClick);
-    });
-    const loggedUserName = getLoggedUser();
-    const userNameEls = document.querySelectorAll('#loggedUserName');
-    userNameEls.forEach(el => {
-        el.textContent = loggedUserName || 'User';
-    });
 }
 
 function handleSidebarClick(event) {
@@ -1319,6 +1369,63 @@ function addInvoice() {
     errorDiv.classList.add('hidden');
     renderInvoiceTable();
     renderAllocationTables();
+    syncManualAchievementToFirebase(newInvoice, target).catch(err => {
+        console.error('Manual achievement Firebase sync failed:', err);
+    });
+}
+
+async function syncManualAchievementToFirebase(invoice, targetQty) {
+    if (!invoice || !invoice.customerCode || !invoice.item) return;
+    const cleanUser = (getActiveDataUser() || getLoggedUser() || "").toString().trim().toUpperCase();
+    const rowUser = cleanUser && cleanUser !== "ALL" && cleanUser !== "ADMIN"
+        ? cleanUser
+        : (getLoggedUser() || "").toString().trim().toUpperCase();
+    const today = new Date().toISOString().slice(0, 10);
+    let updated = false;
+
+    excelData = (excelData || []).map(row => {
+        const sameCustomer = (row.CustomerCode || "").toString().trim().toUpperCase() === invoice.customerCode;
+        const sameItem = (row.Item1 || "").toString().trim().toUpperCase() === invoice.item;
+        const users = [row.User1, row.User2].map(user => (user || "").toString().trim().toUpperCase()).filter(Boolean);
+        const sameUser = !rowUser || rowUser === "ADMIN" || users.length === 0 || users.includes(rowUser);
+        if (!updated && sameCustomer && sameItem && sameUser) {
+            updated = true;
+            return {
+                ...row,
+                City: row.City || invoice.city || "",
+                Customer: row.Customer || invoice.customer || "",
+                Target1: Number(row.Target1 || targetQty || 0),
+                Achieve1: Number(row.Achieve1 || 0) + Number(invoice.quantity || 0),
+                User1: row.User1 || rowUser,
+                Date: today
+            };
+        }
+        return row;
+    });
+
+    if (!updated) {
+        excelData.push({
+            City: invoice.city || "",
+            CustomerCode: invoice.customerCode,
+            Customer: invoice.customer || "",
+            Item1: invoice.item,
+            Target1: Number(targetQty || 0),
+            Achieve1: Number(invoice.quantity || 0),
+            User1: rowUser,
+            User2: "",
+            DealQty: 0,
+            DealBonus: 0,
+            SummaryNumber: "",
+            CompanyName: "",
+            Value: 0,
+            Date: today,
+            ItemRate: 0
+        });
+    }
+
+    localStorage.setItem("excelData", JSON.stringify(excelData));
+    if (cleanUser === "ALL") localStorage.setItem("excelDataAll", JSON.stringify(excelData));
+    if (typeof saveCSVToFirebase === "function") await saveCSVToFirebase(excelData);
 }
 
 function renderInvoiceTable() {
@@ -1539,16 +1646,14 @@ if (
     selectedFilter !== "all" &&
     selectedFilter !== "top10" &&
     selectedFilter !== "nonProductive" &&     // allow nonProductive
-    selectedFilter !== "zeroTarget" &&
     selectedFilter !== statusType
 ) return;
 
-if (selectedFilter === "zeroTarget" && targetQtyNum !== 0) return;
+                const targetCell = targetQtyNum === 0
+                    ? `<div class="flex flex-col sm:flex-row gap-1"><input id="${safeTargetInputId(customerCode, item)}" type="number" min="1" class="border rounded px-2 py-1 w-24 text-black" placeholder="Target"><button onclick="setTargetForZeroItem('${String(customerCode).replace(/'/g, "\\'")}', '${String(item).replace(/'/g, "\\'")}')" class="bg-orange-500 hover:bg-orange-600 text-white px-2 py-1 rounded">Set</button></div>`
+                    : targetQtyNum.toLocaleString();
 
                 visibleItems.add(item);
-                const targetCell = targetQtyNum === 0
-                  ? `<div class="flex gap-1 items-center"><input id="${safeTargetInputId(customerCode, item)}" type="number" min="1" class="w-20 border rounded px-1 py-0.5 text-gray-900" placeholder="Target"><button onclick="setTargetForZeroItem('${customerCode.replace(/'/g, "\\'")}', '${item.replace(/'/g, "\\'")}')" class="bg-orange-600 text-white px-2 py-1 rounded text-xs">Set</button></div>`
-                  : targetQtyNum.toLocaleString();
 
                 rowsHtml+=`<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:text-sm">
                     <td class="border p-1 sm:p-2">${customer.city||''}</td>
@@ -1671,6 +1776,7 @@ if (breakingNews) {
     }
 }
 }
+
 
 
 
@@ -1845,7 +1951,10 @@ if (
                 let statusType = "normal";
                 let rowClass = customerShade;
 
-                if (remaining < 0) {
+                if (Number(target) === 0) {
+                    rowClass = "bg-orange-100";
+                    statusType = "zeroTarget";
+                } else if (remaining < 0) {
                     rowClass = "bg-red-500 text-white";
                     statusType = "red";
                 } else if (remaining <= 0) {
@@ -1862,6 +1971,7 @@ else {
     if (
         selectedStatus !== "all" &&
         selectedStatus !== "top10" &&
+        selectedStatus !== "nonProductive" &&
         selectedStatus !== statusType
     ) return;
 }
@@ -1892,7 +2002,7 @@ popupRows += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:t
     <td class="border p-1 sm:p-2">${target}</td>
     <td class="border p-1 sm:p-2">${achieved}</td>
     <td class="border p-1 sm:p-2">${remaining}</td>
-    <td class="border p-1 sm:p-2 font-bold">${remaining <= 0 ? "100%" : ((achieved/target*100).toFixed(1)+"%")}</td>
+    <td class="border p-1 sm:p-2 font-bold">${Number(target) > 0 ? (remaining <= 0 ? "100%" : ((achieved/target*100).toFixed(1)+"%")) : "0%"}</td>
     <td class="border p-1 sm:p-2 font-bold">${value.toLocaleString()}</td>
 </tr>`;
 
@@ -1912,7 +2022,7 @@ popupRows += `<tr class="${rowClass} hover:bg-indigo-100 transition text-xs sm:t
     if (!popupRows) return;
 
     // --- Summary Footer Row ---
-  let summaryRow = "";
+ let summaryRow = "";
 
 // 🔵 ITEM SUMMARY POPUP
 if (selectedStatus === "cityWise" || selectedStatus === "cityWiseRed" || selectedStatus === "cityWiseGreen") {
@@ -2061,9 +2171,6 @@ else {
 
 
 
-
-
-
 function renderAllocationTables(customerCode = null) {
     const tablesContainer = document.getElementById('allocationTables');
     if (!tablesContainer) {
@@ -2171,37 +2278,17 @@ function renderAllocationTables(customerCode = null) {
     // --- Final HTML Output ---
     tablesContainer.innerHTML = `
         <!-- Header -->
-
- <!-- Header -->
-
-<div class="mb-6 p-6 rounded-2xl shadow-lg bg-gradient-to-r from-purple-700 via-purple-800 to-gray-900 relative text-center">
-  
-  <!-- Rank Badge in Top-Right Corner -->
-  <p class="text-sm font-bold px-3 py-1 rounded-full text-black absolute top-4 LEFT-4"
-     style="background-color: ${levelColor}">
-     ${customerLevel}
-  </p>
-
-  <!-- Dashboard Title -->
-  <h2 class="text-lg font-extrabold text-white drop-shadow-lg">
-    📊 Customer Dashboard
-  </h2>
-
-  <!-- Distributor Name -->
-  <h2 class="text-lg font-extrabold text-green-500 mt-4">
-    NOOR DISTRIBUTOR JNG
-  </h2>
-
-  <!-- Customer Name -->
-  <p class="text-3xl font-extrabold text-yellow-400 drop-shadow-lg mt-4">
-    ${customer.name || 'Unknown Name'}
-  </p>
-
-  <!-- Customer City & Code -->
-  <p class="text-gray-300 text-sm mt-1">
-    ${customer.city || 'Unknown City'} • ${customerCode}
-  </p>
-</div>
+        <div class="mb-6 text-center p-6 rounded-2xl shadow-lg bg-gradient-to-r from-purple-700 via-purple-800 to-gray-900">
+            <div class="flex justify-between items-center">
+                <p class="text-sm font-bold px-3 py-1 rounded-full text-black" style="background-color:${levelColor}">
+                    ${customerLevel}
+                </p>
+                <h2 class="text-lg font-extrabold text-white drop-shadow-lg flex-grow text-center">📊 Customer Dashboard</h2>
+                <span></span>
+            </div>
+            <p class="text-3xl font-extrabold text-yellow-400 drop-shadow-lg mt-2">${customer.name || 'Unknown Name'}</p>
+            <p class="text-gray-300 text-sm mt-1">${customer.city || 'Unknown City'} • ${customerCode}</p>
+        </div>
 
         <!-- KPI Cards -->
         <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
@@ -3234,58 +3321,33 @@ function dataURLtoBlob(dataurl) {
     return new Blob([u8arr], { type: mime });
 }
 
-// --------------- My Sale: clean implementation ---------------
-
-// optional: keep this if you use toggleSections elsewhere
+// --------------- My Sale: online implementation ---------------
 function toggleSections() {
   document.getElementById("formGrid")?.classList.toggle("hidden");
   document.getElementById("customContent")?.classList.toggle("hidden");
 }
 
-// load existing data (single declaration)
 let mySaleData = JSON.parse(localStorage.getItem("mySaleData") || "[]");
 
-// show / hide pages and mark active nav
 function showMySalePage() {
-  // hide all other pages
   const pages = ["mainPage", "allocationPage", "doneTargetPage", "bonusPage"];
-  pages.forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.classList.add("hidden");
-  });
-
-  // show only My Sale Page
+  pages.forEach(id => document.getElementById(id)?.classList.add("hidden"));
   const salePage = document.getElementById("mySalePage");
   if (salePage) salePage.classList.remove("hidden");
-
-  // reset nav active states
   ["navInvoiceEntry","navAllocation","navDoneTargets","navBonus","navMySale","navMysale"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.classList.remove("bg-primary","text-white","bg-yellow-600");
   });
-
-  // highlight nav for My Sale
   const nav = document.getElementById("navMySale") || document.getElementById("navMysale");
   if (nav) nav.classList.add("bg-yellow-600","text-white");
-
-  // render table
-  if (typeof syncMySaleFromFirebase === "function") {
-    syncMySaleFromFirebase();
-  } else if (typeof renderMySaleTable === "function") {
-    renderMySaleTable();
-  }
+  syncMySaleFromFirebase();
   renderSaleUploadHistory();
 }
 
-
-// render table + total
 function renderMySaleTable() {
-  // reload from localStorage before rendering (refresh feature)
   mySaleData = JSON.parse(localStorage.getItem("mySaleData") || "[]");
-
   const salePage = document.getElementById("mySalePage");
   if (!salePage) return;
-
   const companyTbody = salePage.querySelector("#mySaleCompanyTableBody") || salePage.querySelector("#mySaleTableBody");
   const dateTbody = salePage.querySelector("#mySaleDateTableBody");
   const companyTotalEl = salePage.querySelector("#mySaleCompanyTotal") || salePage.querySelector("#mySaleTotal");
@@ -3350,7 +3412,6 @@ function renderMySaleTable() {
   if (legacyTotalEl) legacyTotalEl.textContent = formatNumber(companyGrandTotal);
 }
 
-// small helpers
 function formatNumber(n){ return Number(n).toLocaleString(); }
 function escapeHtml(s){ return (s===undefined || s===null) ? "" : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function getMonthStartToTodayRange() {
@@ -3414,257 +3475,33 @@ function resetMySaleDateFilter() {
   if (toEl) toEl.value = defaults.to;
   renderMySaleTable();
 }
-function isValidDateString(s) { return !isNaN(Date.parse(s)); }
-function pickLatestDate(a,b){
-  if (!a) return b || a;
-  if (!b) return a;
-  const da = Date.parse(a);
-  const db = Date.parse(b);
-  if (!isNaN(da) && !isNaN(db)) {
-    return new Date(Math.max(da, db)).toISOString().split('T')[0];
-  }
-  return b.length >= a.length ? b : a;
-}
-
-function calculatePerformanceForRows(rows) {
-  const targets = {};
-  const invRows = [];
-  (rows || []).forEach(row => {
-    const code = (row.CustomerCode || "").toString().trim().toUpperCase();
-    const item = (row.Item1 || "").toString().trim().toUpperCase();
-    if (!code || !item) return;
-    if (!targets[code]) targets[code] = {};
-    targets[code][item] = (targets[code][item] || 0) + Number(row.Target1 || 0);
-    invRows.push({ code, item, qty: Number(row.Achieve1 || 0), value: Number(row.Value || 0) });
-  });
-  let totalCustomerScore = 0;
-  let customerCount = 0;
-  Object.entries(targets).forEach(([code, items]) => {
-    const itemEntries = Object.entries(items).filter(([, target]) => Number(target) > 0);
-    if (!itemEntries.length) return;
-    let totalTargetQty = 0;
-    let totalAchievedQty = 0;
-    let completedItems = 0;
-    itemEntries.forEach(([item, target]) => {
-      const achievedQty = invRows
-        .filter(inv => inv.code === code && inv.item === item)
-        .reduce((sum, inv) => sum + Number(inv.qty || 0), 0);
-      totalTargetQty += Number(target);
-      totalAchievedQty += achievedQty;
-      if (achievedQty >= Number(target)) completedItems++;
-    });
-    const achievedPercent = totalTargetQty > 0 ? (totalAchievedQty / totalTargetQty) * 100 : 0;
-    const itemCompletionPercent = (completedItems / itemEntries.length) * 100;
-    totalCustomerScore += (achievedPercent * 0.7) + (itemCompletionPercent * 0.3);
-    customerCount++;
-  });
-  return customerCount ? Number((totalCustomerScore / customerCount).toFixed(1)) : 0;
-}
-
-function getBookerRankings() {
-  const rankMap = {};
-  let rows = bookerRankSourceRows && bookerRankSourceRows.length
-    ? bookerRankSourceRows
-    : JSON.parse(localStorage.getItem("bookerRankSourceRows") || "[]");
-  if (!rows.length) rows = excelData || [];
-  rows.forEach(row => {
-    const users = [row.User1, row.User2]
-      .map(user => (user || "").toString().trim().toUpperCase())
-      .filter(Boolean);
-    [...new Set(users)].forEach(user => {
-      if (!rankMap[user]) rankMap[user] = { name: user, target: 0, achieve: 0, value: 0, rows: 0, sourceRows: [] };
-      rankMap[user].target += Number(row.Target1 || 0);
-      rankMap[user].achieve += Number(row.Achieve1 || 0);
-      rankMap[user].value += Number(row.Value || 0);
-      rankMap[user].rows += 1;
-      rankMap[user].sourceRows.push(row);
-    });
-  });
-  return Object.values(rankMap)
-    .map(item => ({
-      ...item,
-      percent: calculatePerformanceForRows(item.sourceRows)
-    }))
-    .sort((a, b) => b.percent - a.percent || b.achieve - a.achieve || b.value - a.value);
-}
-
-async function syncBookerRankingsFromFirebase() {
-  try {
-    if (typeof DATABASE_URL !== "string" || !DATABASE_URL) return;
-    const res = await fetch(`${DATABASE_URL}/csvUploads.json`);
-    if (!res.ok) return;
-    const json = await res.json();
-    const rows = [];
-    if (json && typeof json === "object") {
-      Object.values(json).forEach(node => {
-        if (node?.latest?.rows && Array.isArray(node.latest.rows)) rows.push(...node.latest.rows);
-      });
+function normalizeDateValue(value) {
+  const raw = (value || "").toString().trim();
+  if (!raw) return "";
+  const parsed = Date.parse(raw);
+  if (!isNaN(parsed)) return new Date(parsed).toISOString().slice(0, 10);
+  const parts = raw.split(/[\/\-\.]/).map(part => part.trim());
+  if (parts.length === 3) {
+    const [a,b,c] = parts;
+    if (c.length === 4) {
+      const iso = `${c}-${b.padStart(2,"0")}-${a.padStart(2,"0")}`;
+      if (!isNaN(Date.parse(iso))) return iso;
     }
-    if (rows.length) {
-      bookerRankSourceRows = rows;
-      localStorage.setItem("bookerRankSourceRows", JSON.stringify(bookerRankSourceRows));
-      renderBookerRankingBox();
-    }
-  } catch (err) {
-    console.warn("Booker rank all-user sync skipped:", err);
   }
+  return raw;
 }
-
-function renderBookerRankingBox() {
-  const ticker = document.getElementById("bookerRankTicker");
-  if (!ticker) return;
-  const rankings = getBookerRankings();
-  if (!rankings.length) {
-    ticker.textContent = "No data";
-    return;
-  }
-  if (window.bookerRankTimer) clearInterval(window.bookerRankTimer);
-  let index = 0;
-  const paint = () => {
-    const item = rankings[index % rankings.length];
-    ticker.innerHTML = `#${index % rankings.length + 1} ${escapeHtml(item.name)}<br><span class="font-semibold">${item.percent}% | ${formatNumber(item.achieve)}</span>`;
-    index++;
-  };
-  paint();
-  window.bookerRankTimer = setInterval(paint, 1800);
-}
-
-function openBookerRankingModal() {
-  const rankings = getBookerRankings();
-  let modal = document.getElementById("bookerRankingModal");
-  if (!modal) {
-    modal = document.createElement("div");
-    modal.id = "bookerRankingModal";
-    modal.className = "fixed inset-0 z-50 hidden items-center justify-center bg-black bg-opacity-60 p-4";
-    document.body.appendChild(modal);
-  }
-  const maxPercent = Math.max(100, ...rankings.map(r => r.percent));
-  const rows = rankings.length ? rankings.map((r, i) => {
-    const width = Math.max(5, Math.min(100, Math.round((r.percent / maxPercent) * 100)));
-    return `<div class="mb-4">
-      <div class="flex justify-between text-sm font-semibold text-gray-800">
-        <span>#${i + 1} ${escapeHtml(r.name)}</span>
-        <span>${r.percent}%</span>
-      </div>
-      <div class="h-4 bg-gray-200 rounded-full overflow-hidden mt-1">
-        <div class="h-full bg-gradient-to-r from-cyan-500 to-blue-700 rounded-full" style="width:${width}%"></div>
-      </div>
-      <div class="text-xs text-gray-500 mt-1">Target ${formatNumber(r.target)} | Achieve ${formatNumber(r.achieve)} | Value ${formatNumber(r.value)}</div>
-    </div>`;
-  }).join("") : `<p class="text-center text-gray-500">No booker performance data found.</p>`;
-  modal.innerHTML = `<div class="bg-white w-full max-w-3xl rounded-xl shadow-2xl max-h-[85vh] overflow-auto">
-    <div class="flex items-center justify-between p-4 border-b">
-      <h2 class="text-xl font-bold text-gray-900">Booker Performance Ranking</h2>
-      <button onclick="closeBookerRankingModal()" class="px-3 py-1 rounded-lg bg-gray-800 text-white font-bold">X</button>
-    </div>
-    <div class="p-5">${rows}</div>
-  </div>`;
-  modal.classList.remove("hidden");
-  modal.classList.add("flex");
-}
-
-function closeBookerRankingModal() {
-  const modal = document.getElementById("bookerRankingModal");
-  if (modal) {
-    modal.classList.add("hidden");
-    modal.classList.remove("flex");
-  }
-}
-
-function normalizeSaleHeader(value) {
-  return (value || "")
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function getSaleCell(row, headerMap, names, fallbackIndex) {
-  for (const name of names) {
-    const index = headerMap[normalizeSaleHeader(name)];
-    if (index !== undefined && row[index] !== undefined) return row[index];
-  }
-  return row[fallbackIndex] ?? "";
-}
-
-function parseSaleCsvRecords(rows) {
-  if (!rows || !rows.length) return [];
-  const firstRow = rows[0] || [];
-  const headerMap = {};
-  firstRow.forEach((cell, index) => {
-    const key = normalizeSaleHeader(cell);
-    if (key) headerMap[key] = index;
-  });
-  const hasHeader = headerMap.value !== undefined || headerMap.company !== undefined || headerMap.summery !== undefined || headerMap.summary !== undefined || headerMap.serialnum !== undefined || headerMap.serialnumber !== undefined || headerMap.serial !== undefined;
-  const dataRows = hasHeader ? rows.slice(1) : rows;
-  const summaryFallback = hasHeader ? 4 : (firstRow.length >= 14 ? 10 : 4);
-  const companyFallback = hasHeader ? 5 : (firstRow.length >= 14 ? 11 : 5);
-  const valueFallback = hasHeader ? 6 : (firstRow.length >= 14 ? 12 : 6);
-  const dateFallback = hasHeader ? 7 : (firstRow.length >= 14 ? 13 : 7);
-
-  return dataRows.map(row => {
-    const summary = getSaleCell(row, headerMap, ["serialnum", "serialnumber", "serial", "srno", "sr", "companynumber", "summarynumber", "summery", "summary"], summaryFallback).toString().trim();
-    const company = getSaleCell(row, headerMap, ["company", "companyname"], companyFallback).toString().trim();
-    const valueRaw = getSaleCell(row, headerMap, ["value", "sale"], valueFallback).toString().trim();
-    const date = getSaleCell(row, headerMap, ["date", "tilldate", "tiltodate"], dateFallback).toString().trim();
-    const user1 = getSaleCell(row, headerMap, ["user", "user1"], 0).toString().trim();
-    const user2 = getSaleCell(row, headerMap, ["user2"], 1).toString().trim();
-    const value = parseFloat(valueRaw.replace(/,/g, ""));
-    if (!summary || isNaN(value)) return null;
-    return { summary, company, value, date, user1, user2 };
-  }).filter(Boolean);
-}
-
-function addSaleUploadHistory(fileName, records) {
-  const history = JSON.parse(localStorage.getItem("saleUploadHistory") || "[]");
-  const total = records.reduce((sum, item) => sum + (Number(item.value) || 0), 0);
-  history.unshift({
-    fileName: fileName || "sale.csv",
-    rows: records.length,
-    total,
-    uploadedAt: new Date().toLocaleString()
-  });
-  localStorage.setItem("saleUploadHistory", JSON.stringify(history.slice(0, 25)));
-  renderSaleUploadHistory();
-}
-
-function renderSaleUploadHistory() {
-  const box = document.getElementById("saleUploadHistory");
-  if (!box) return;
-  const history = JSON.parse(localStorage.getItem("saleUploadHistory") || "[]");
-  if (!history.length) {
-    box.innerHTML = "No upload record";
-    return;
-  }
-  box.innerHTML = history.map(item => `
-    <div class="flex flex-wrap justify-between gap-2 border-b py-2 last:border-b-0">
-      <span class="font-semibold">${escapeHtml(item.fileName)}</span>
-      <span>${escapeHtml(item.uploadedAt)}</span>
-      <span>Rows: ${formatNumber(item.rows)}</span>
-      <span>Total: ${formatNumber(item.total)}</span>
-    </div>
-  `).join("");
-}
-
-function clearSaleUploadHistory() {
-  if (!confirm("Clear CSV upload record? Sale table data will remain.")) return;
-  localStorage.removeItem("saleUploadHistory");
-  renderSaleUploadHistory();
-}
-
+function pickLatestDate(a,b){ return normalizeDateValue(b) || normalizeDateValue(a) || b || a || ""; }
 function normalizeSaleRecord(sale) {
   return {
     id: sale.id || `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     summary: (sale.summary || "").toString().trim(),
     company: (sale.company || "").toString().trim(),
     value: Number(sale.value) || 0,
-    date: normalizeDateValue(sale.date) || sale.date || new Date().toISOString().slice(0, 10),
+    date: normalizeDateValue(sale.date) || new Date().toISOString().slice(0, 10),
     user: (sale.user || getActiveDataUser() || getLoggedUser() || "").toString().trim().toUpperCase(),
     createdAt: sale.createdAt || new Date().toISOString()
   };
 }
-
 function upsertLocalSaleRecords(records) {
   const byKey = {};
   (JSON.parse(localStorage.getItem("mySaleData") || "[]") || []).forEach(sale => {
@@ -3679,8 +3516,7 @@ function upsertLocalSaleRecords(records) {
   localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
   renderMySaleTable();
 }
-
-async function saveMySaleToFirebase(records) {
+async function saveMySaleToFirebase() {
   try {
     if (typeof DATABASE_URL !== "string" || !DATABASE_URL) return;
     const current = JSON.parse(localStorage.getItem("mySaleData") || "[]");
@@ -3697,183 +3533,246 @@ async function saveMySaleToFirebase(records) {
       byUser[user] = [];
     }
     await Promise.all(Object.entries(byUser).map(([user, rows]) => {
-      const payload = {
-        uploadedAt: new Date().toISOString(),
-        uploadedBy: getLoggedUser() || user,
-        rows
-      };
+      const payload = { uploadedAt: new Date().toISOString(), uploadedBy: getLoggedUser() || user, rows };
       return Promise.all([
-        fetch(`${DATABASE_URL}/mySales/${user}/latest.json`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        }),
-        fetch(`${DATABASE_URL}/csvUploads/${user}/mySales/latest.json`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        })
+        fetch(`${DATABASE_URL}/mySales/${user}/latest.json`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload) }),
+        fetch(`${DATABASE_URL}/csvUploads/${user}/mySales/latest.json`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload) })
       ]);
     }));
-  } catch (err) {
-    console.error("My Sale Firebase save failed:", err);
-  }
+  } catch (err) { console.error("My Sale Firebase save failed:", err); }
 }
-
+function getSaleRowsFromMainRows(rows) {
+  const saleMap = {};
+  (rows || []).map(normalizeMainRow).forEach(row => {
+    const value = Number(row.Value) || 0;
+    const summary = (row.SummaryNumber || "").toString().trim();
+    const company = (row.CompanyName || "").toString().trim();
+    const user = (row.User1 || row.User2 || "").toString().trim().toUpperCase();
+    if (!user || user === "ADMIN" || user === "ALL" || !summary || !value) return;
+    const date = normalizeDateValue(row.Date) || new Date().toISOString().slice(0, 10);
+    const key = `${user}|${date}|${summary}|${company}`;
+    if (!saleMap[key]) saleMap[key] = { summary, company, value: 0, date, user };
+    saleMap[key].value += value;
+  });
+  return Object.values(saleMap);
+}
+function mergeSaleRecordArrays(...groups) {
+  const byKey = {};
+  groups.flat().map(normalizeSaleRecord).forEach(row => {
+    const user = (row.user || "").toString().trim().toUpperCase();
+    if (!user || user === "ADMIN" || user === "ALL") return;
+    if (!row.summary && !row.company && !row.value) return;
+    const key = `${user}|${row.date}|${row.summary}|${row.company}`;
+    byKey[key] = row;
+  });
+  return Object.values(byKey);
+}
+async function saveMainCsvSalesToFirebase(rows, uploadedBy) {
+  const saleRows = getSaleRowsFromMainRows(rows);
+  if (!saleRows.length) return { rows: 0, users: 0 };
+  const previous = JSON.parse(localStorage.getItem("mySaleData") || "[]");
+  upsertLocalSaleRecords(saleRows);
+  await saveMySaleToFirebase();
+  const users = [...new Set(saleRows.map(row => row.user).filter(Boolean))];
+  addSaleUploadHistory("main_csv_sales", saleRows);
+  console.log(`Main CSV sales saved by ${uploadedBy || getLoggedUser() || "ADMIN"}: ${saleRows.length} rows / ${users.length} users.`);
+  if ((getActiveDataUser() || "").toString().trim().toUpperCase() === "ALL") {
+    mySaleData = JSON.parse(localStorage.getItem("mySaleData") || "[]");
+  } else if (previous.length) {
+    mySaleData = JSON.parse(localStorage.getItem("mySaleData") || "[]");
+  }
+  return { rows: saleRows.length, users: users.length };
+}
 async function fetchMySalePayloadForUser(user) {
-  const paths = [
-    `${DATABASE_URL}/mySales/${user}/latest.json`,
-    `${DATABASE_URL}/csvUploads/${user}/mySales/latest.json`
-  ];
-  for (const url of paths) {
+  for (const url of [`${DATABASE_URL}/mySales/${user}/latest.json`, `${DATABASE_URL}/csvUploads/${user}/mySales/latest.json`]) {
     try {
       const res = await fetch(url);
       if (!res.ok) continue;
       const json = await res.json();
       if (json && Array.isArray(json.rows)) return json;
-    } catch (err) {
-      console.warn("My Sale fetch path skipped:", err);
-    }
+    } catch (err) { console.warn("My Sale fetch path skipped:", err); }
   }
   return null;
 }
+function collectMySaleRowsFromNode(node, output) {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node.rows)) {
+    output.push(...node.rows);
+    return;
+  }
+  Object.values(node).forEach(child => collectMySaleRowsFromNode(child, output));
+}
+async function fetchAllMySaleRows() {
+  const byKey = {};
+  const addRows = (rows, fallbackUser = "") => {
+    (rows || []).forEach(row => {
+      const clean = normalizeSaleRecord({ ...row, user: row.user || fallbackUser });
+      if (!clean.user || clean.user === "ADMIN" || clean.user === "ALL") return;
+      if (!clean.summary && !clean.company && !clean.value) return;
+      const key = `${clean.user}|${clean.date}|${clean.summary}|${clean.company}`;
+      byKey[key] = clean;
+    });
+  };
+  const collectByUser = (json, nodeSelector) => {
+    if (!json || typeof json !== "object") return;
+    Object.entries(json).forEach(([user, node]) => {
+      const cleanUser = (user || "").toString().trim().toUpperCase();
+      if (!cleanUser || cleanUser === "ADMIN" || cleanUser === "ALL") return;
+      const saleNode = nodeSelector(node);
+      const rows = [];
+      collectMySaleRowsFromNode(saleNode, rows);
+      addRows(rows, cleanUser);
+    });
+  };
 
-async function syncMySaleFromFirebase(onDone) {
   try {
-    const user = getActiveDataUser();
-    if (!user || typeof DATABASE_URL !== "string" || !DATABASE_URL) {
-      renderMySaleTable();
-      if (onDone) onDone(mySaleData);
-      return;
-    }
-    const json = await fetchMySalePayloadForUser(user);
-    if (json && Array.isArray(json.rows)) {
-      mySaleData = json.rows.map(normalizeSaleRecord);
-      localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
-    } else {
-      mySaleData = [];
-      localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
+    const res = await fetch(`${DATABASE_URL}/mySales.json`);
+    if (res.ok) collectByUser(await res.json(), node => node);
+  } catch (err) {
+    console.warn("All My Sale /mySales fetch skipped:", err);
+  }
+
+  try {
+    const res = await fetch(`${DATABASE_URL}/csvUploads.json`);
+    if (res.ok) collectByUser(await res.json(), node => node?.mySales);
+  } catch (err) {
+    console.warn("All My Sale /csvUploads mySales fetch skipped:", err);
+  }
+
+  try {
+    const res = await fetch(`${DATABASE_URL}/csvUploads/ALL/latest.json`);
+    if (res.ok) {
+      const json = await res.json();
+      if (json && Array.isArray(json.rows)) addRows(getSaleRowsFromMainRows(json.rows));
     }
   } catch (err) {
-    console.warn("My Sale Firebase sync skipped:", err);
+    console.warn("All My Sale central CSV sale fallback skipped:", err);
   }
+  return Object.values(byKey);
+}
+async function syncMySaleFromFirebase(onDone, forceUser = null) {
+  try {
+    const currentUser = (getLoggedUser() || "").toString().trim().toUpperCase();
+    if (!currentUser || typeof DATABASE_URL !== "string" || !DATABASE_URL) { renderMySaleTable(); if(onDone) onDone(mySaleData); return; }
+    const targetUser = currentUser === "ADMIN" ? (forceUser || getActiveDataUser() || currentUser).toString().trim().toUpperCase() : currentUser;
+    if (currentUser === "ADMIN" && targetUser === "ALL") {
+      const firebaseSales = await fetchAllMySaleRows();
+      const localAllRows = [
+        ...(JSON.parse(localStorage.getItem("excelDataAll") || "[]") || []),
+        ...(JSON.parse(localStorage.getItem("excelData") || "[]") || []),
+        ...(Array.isArray(excelData) ? excelData : [])
+      ];
+      const localSales = getSaleRowsFromMainRows(localAllRows);
+      mySaleData = mergeSaleRecordArrays(firebaseSales, localSales);
+      localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
+    } else {
+      const json = await fetchMySalePayloadForUser(targetUser);
+      if (json && Array.isArray(json.rows)) {
+        mySaleData = json.rows.map(normalizeSaleRecord);
+        localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
+      } else {
+        mySaleData = [];
+        localStorage.setItem("mySaleData", JSON.stringify(mySaleData));
+      }
+    }
+  } catch (err) { console.warn("My Sale Firebase sync skipped:", err); }
   renderMySaleTable();
   if (onDone) onDone(mySaleData);
 }
-
 function addManualSale() {
   const summary = document.getElementById("manualSaleNumber")?.value || "";
   const company = document.getElementById("manualSaleCompany")?.value || "";
   const value = Number(document.getElementById("manualSaleValue")?.value || 0);
   const date = document.getElementById("manualSaleDate")?.value || new Date().toISOString().slice(0, 10);
-  if (!summary.trim() || !company.trim() || !value) {
-    alert("Please enter serial/company number, company and sale value.");
-    return;
-  }
+  if (!summary.trim() || !company.trim() || !value) { alert("Please enter serial/company number, company and sale value."); return; }
   const record = normalizeSaleRecord({ summary, company, value, date });
   upsertLocalSaleRecords([record]);
-  saveMySaleToFirebase([record]);
-  ["manualSaleNumber", "manualSaleCompany", "manualSaleValue"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.value = "";
-  });
+  saveMySaleToFirebase();
+  showAppNotification("Manual sale saved successfully.", "success");
+  ["manualSaleNumber", "manualSaleCompany", "manualSaleValue"].forEach(id => { const el = document.getElementById(id); if (el) el.value = ""; });
 }
-
-// process parsed CSV rows (merge by user/date/company/summary)
+function normalizeSaleHeader(value) { return (value || "").toString().trim().toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9]/g, ""); }
+function getSaleCell(row, headerMap, names, fallbackIndex) {
+  for (const name of names) { const index = headerMap[normalizeSaleHeader(name)]; if (index !== undefined && row[index] !== undefined) return row[index]; }
+  return row[fallbackIndex] ?? "";
+}
+function parseSaleCsvRecords(rows) {
+  if (!rows || !rows.length) return [];
+  const firstRow = rows[0] || [];
+  const headerMap = {};
+  firstRow.forEach((cell, index) => { const key = normalizeSaleHeader(cell); if (key) headerMap[key] = index; });
+  const hasHeader = headerMap.value !== undefined || headerMap.company !== undefined || headerMap.summery !== undefined || headerMap.summary !== undefined || headerMap.serialnum !== undefined || headerMap.serial !== undefined;
+  const dataRows = hasHeader ? rows.slice(1) : rows;
+  const summaryFallback = hasHeader ? 4 : (firstRow.length >= 14 ? 10 : 4);
+  const companyFallback = hasHeader ? 5 : (firstRow.length >= 14 ? 11 : 5);
+  const valueFallback = hasHeader ? 6 : (firstRow.length >= 14 ? 12 : 6);
+  const dateFallback = hasHeader ? 7 : (firstRow.length >= 14 ? 13 : 7);
+  return dataRows.map(row => {
+    const summary = getSaleCell(row, headerMap, ["serialnum","serialnumber","serial","srno","sr","companynumber","summarynumber","summery","summary"], summaryFallback).toString().trim();
+    const company = getSaleCell(row, headerMap, ["company","companyname"], companyFallback).toString().trim();
+    const valueRaw = getSaleCell(row, headerMap, ["value","sale"], valueFallback).toString().trim();
+    const date = getSaleCell(row, headerMap, ["date","tilldate","tiltodate"], dateFallback).toString().trim();
+    const user1 = getSaleCell(row, headerMap, ["user","user1"], 0).toString().trim();
+    const user2 = getSaleCell(row, headerMap, ["user2"], 1).toString().trim();
+    const value = parseFloat(valueRaw.replace(/,/g, ""));
+    if (!summary || isNaN(value)) return null;
+    return { summary, company, value, date, user: user1 || user2 || getActiveDataUser() };
+  }).filter(Boolean);
+}
+function addSaleUploadHistory(fileName, records) {
+  const history = JSON.parse(localStorage.getItem("saleUploadHistory") || "[]");
+  const total = records.reduce((sum, item) => sum + (Number(item.value) || 0), 0);
+  history.unshift({ fileName: fileName || "sale.csv", rows: records.length, total, uploadedAt: new Date().toLocaleString() });
+  localStorage.setItem("saleUploadHistory", JSON.stringify(history.slice(0,25)));
+  renderSaleUploadHistory();
+}
+function renderSaleUploadHistory() {
+  const box = document.getElementById("saleUploadHistory");
+  if (!box) return;
+  const history = JSON.parse(localStorage.getItem("saleUploadHistory") || "[]");
+  if (!history.length) { box.innerHTML = "No upload record"; return; }
+  box.innerHTML = history.map(item => `<div class="flex flex-wrap justify-between gap-2 border-b py-2 last:border-b-0"><span class="font-semibold">${escapeHtml(item.fileName)}</span><span>${escapeHtml(item.uploadedAt)}</span><span>Rows: ${formatNumber(item.rows)}</span><span>Total: ${formatNumber(item.total)}</span></div>`).join("");
+}
+function clearSaleUploadHistory() { if (!confirm("Clear CSV upload record? Sale table data will remain.")) return; localStorage.removeItem("saleUploadHistory"); renderSaleUploadHistory(); }
 function processSaleCsvRows(rows) {
-  if (!rows || rows.length === 0) return;
-
   const records = parseSaleCsvRecords(rows);
-  const batchMap = {};
+  const batch = {};
   records.forEach(record => {
-    const saleUser = record.user1 || record.user2 || getActiveDataUser();
-    const key = `${saleUser}|${record.date || ""}|${record.summary}|${record.company}`;
-    if (!batchMap[key]) batchMap[key] = { summary: record.summary, company: record.company, value: 0, date: record.date, user: saleUser };
-    batchMap[key].value += Number(record.value);
-    batchMap[key].company = record.company || batchMap[key].company;
-    batchMap[key].date = pickLatestDate(batchMap[key].date, record.date);
+    const key = `${(record.user || getActiveDataUser() || "").toString().trim().toUpperCase()}|${record.date || ""}|${record.summary}|${record.company}`;
+    if (!batch[key]) batch[key] = { summary: record.summary, company: record.company, value: 0, date: record.date, user: record.user || getActiveDataUser() };
+    batch[key].value += Number(record.value);
+    batch[key].company = record.company || batch[key].company;
+    batch[key].date = pickLatestDate(batch[key].date, record.date);
   });
-
-  upsertLocalSaleRecords(Object.values(batchMap));
-  saveMySaleToFirebase(Object.values(batchMap));
-  renderBookerRankingBox();
-  console.log(`MySale: processed ${Object.keys(batchMap).length} sale rows`);
+  upsertLocalSaleRecords(Object.values(batch));
+  saveMySaleToFirebase();
   return records;
 }
-
-// CSV change handler
 function handleSaleCsvFileChange(e) {
   const file = e?.target?.files?.[0];
   if (!file) return;
-  Papa.parse(file, {
-    skipEmptyLines: true,
-    complete: function(results) {
-      if (results && results.data) {
-        const records = processSaleCsvRows(results.data) || [];
-        addSaleUploadHistory(file.name, records);
-      } else {
-        console.warn("No rows parsed from CSV");
-      }
-    },
-    error: function(err) {
-      console.error("CSV parse error:", err);
-      alert("CSV parse error: " + err.message);
-    }
-  });
+  Papa.parse(file, { skipEmptyLines: true, complete: function(results) { const records = processSaleCsvRows(results.data || []); addSaleUploadHistory(file.name, records || []); showAppNotification("My Sale CSV uploaded successfully.", "success"); }, error: function(err){ showAppNotification("CSV parse error: " + err.message, "error"); } });
   e.target.value = "";
 }
-
-// reset function with password check
 function resetMySale() {
-  const password = prompt("🔑 Enter password to reset My Sale data:");
-  if (password !== "985973") {
-    alert("❌ Wrong password! Reset cancelled.");
-    return;
-  }
-  if (!confirm("⚠️ Are you sure you want to reset My Sale data? This will remove all saved sales.")) {
-    return;
-  }
+  const password = prompt("Enter password to reset My Sale data:");
+  if (password !== "985973") { alert("Wrong password! Reset cancelled."); return; }
+  if (!confirm("Are you sure you want to reset My Sale data?")) return;
   mySaleData = [];
   localStorage.removeItem("mySaleData");
   renderMySaleTable();
-  saveMySaleToFirebase([]);
-  console.log("MySale: reset");
-  alert("✅ My Sale data has been reset successfully!");
+  saveMySaleToFirebase();
 }
-
-// Attach listeners after DOM ready
 document.addEventListener("DOMContentLoaded", () => {
-  setupDateRangeControls();
-  renderBookerRankingBox();
-
   const saleInput = document.getElementById("saleCsvFile");
-  if (saleInput) {
-    saleInput.removeEventListener("change", handleSaleCsvFileChange);
-    saleInput.addEventListener("change", handleSaleCsvFileChange);
-  }
-
+  if (saleInput) { saleInput.removeEventListener("change", handleSaleCsvFileChange); saleInput.addEventListener("change", handleSaleCsvFileChange); }
   const nav = document.getElementById("navMySale") || document.getElementById("navMysale");
-  if (nav) {
-    nav.removeEventListener("click", showMySalePage);
-    nav.addEventListener("click", showMySalePage);
-  }
-
-  // ✅ add refresh button listener
+  if (nav) { nav.removeEventListener("click", showMySalePage); nav.addEventListener("click", showMySalePage); }
   const refreshBtn = document.getElementById("refreshMySale");
-  if (refreshBtn) {
-    refreshBtn.addEventListener("click", () => {
-      syncMySaleFromFirebase(() => {
-        renderSaleUploadHistory();
-        alert("My Sale data refreshed!");
-      });
-    });
-  }
-
+  if (refreshBtn) refreshBtn.addEventListener("click", () => syncMySaleFromFirebase(() => { renderSaleUploadHistory(); showAppNotification("My Sale data refreshed.", "success"); }));
   renderMySaleTable();
   renderSaleUploadHistory();
 });
-
-
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyCY3r6YelbzubGJvw_dv5ZMM-7bZ7ebsw0",
@@ -3887,7 +3786,6 @@ const firebaseConfig = {
 };
 // example: put this near your firebaseConfig object
 const DATABASE_URL = "https://saniapp-7b4be-default-rtdb.firebaseio.com"; // <-- replace with your Realtime DB URL (no trailing slash)
-
 
 
 function doPost(e) {
@@ -3917,7 +3815,7 @@ function uploadToFirebase(data) {
     body: JSON.stringify(data)
   })
   .then(res => res.json())
-  .then(() => alert("✅ Data uploaded to Firebase!"))
+  .then(() => showAppNotification("Data uploaded to Firebase.", "success"))
   .catch(console.error);
 }
 document.getElementById('excelFile')?.addEventListener('change', (event) => {
@@ -3950,9 +3848,10 @@ document.getElementById('excelFile')?.addEventListener('change', (event) => {
       renderBonusDeals();
       populateBonusItems();
       // Sync data after upload
+      const uploadSyncUser = getActiveDataUser();
       syncUserDataFromFirebase(() => {
-        console.log('✅ Data synced after CSV upload');
-      });
+        console.log('Data synced after CSV upload');
+      }, uploadSyncUser);
     });
   } else {
     alert('Please upload a valid CSV file.');
@@ -3960,128 +3859,11 @@ document.getElementById('excelFile')?.addEventListener('change', (event) => {
   }
 });
 
-// ✅ Manual Sync Button Handler
-document.addEventListener("DOMContentLoaded", () => {
-    const btn = document.getElementById("syncBtn");
-    if (btn) {
-        btn.addEventListener("click", () => {
-            btn.innerText = "⏳ Syncing...";
-            btn.disabled = true;
-            syncUserDataFromFirebase(() => {
-                alert("✅ Data synced successfully!");
-                btn.innerText = "🔄 Sync Data";
-                btn.disabled = false;
-                renderInvoiceTable();
-                syncMySaleFromFirebase();
-            });
-        });
-    }
-});
 
-// 🧩 Fix — Normalize & Map Columns before processing
-const normalizedRows = rows.map(r => {
-  const obj = {};
-  for (let key in r) {
-    const nk = key.trim().toLowerCase();
-    obj[nk] = r[key];
-  }
-
-  return {
-    City: obj['city'] || '',
-    CustomerCode: obj['customercode'] || obj['code'] || '',
-    Customer: obj['customer'] || obj['customername'] || '',
-    Item1: obj['item1'] || obj['item'] || '',
-    Target1: Number(obj['target1'] || obj['target'] || 0),
-    Achieve1: Number(
-      obj['achieve1'] ??
-      obj['achieve'] ??
-      obj['achieved'] ??
-      obj['achievedvalue'] ??
-      obj['achv'] ??
-      0
-    ),
-    User1: obj['user1'] || '',
-    User2: obj['user2'] || '',
-    DealQty: Number(obj['dealqty'] || 0),
-    DealBonus: Number(obj['dealbonus'] || 0),
-    SummaryNumber: obj['summarynumber'] || '',
-    CompanyName: obj['companyname'] || '',
-    Value: Number(
-      (obj['value'] ??
-       obj['val'] ??
-       obj['achievedvalue'] ??
-       '0').toString().replace(/,/g, '')
-    ),
-    Date: obj['date'] || '',
-    ItemRate: Number((obj['itemrate'] || '0').toString().replace(/,/g, ''))
-  };
-});
 
 /* -----------------------------------------------------------------
    ✅ FUNCTION: Process Firebase JSON like CSV upload
 ------------------------------------------------------------------*/
-
-let startupSyncPromptShown = false;
-
-function showStartupSyncPrompt() {
-  if (startupSyncPromptShown || document.getElementById("startupSyncPrompt")) return;
-  if (!(getLoggedUser && getLoggedUser())) return;
-  startupSyncPromptShown = true;
-
-  const modal = document.createElement("div");
-  modal.id = "startupSyncPrompt";
-  modal.className = "startup-sync-overlay";
-  modal.innerHTML = `
-    <div class="startup-sync-card">
-      <h2>SYNC NOW</h2>
-      <p>Fresh Firebase data load karna hai? Yes press karen to aapka latest data abhi sync ho jayega.</p>
-      <div class="startup-sync-actions">
-        <button type="button" class="startup-sync-yes" id="startupSyncYes">Yes</button>
-        <button type="button" class="startup-sync-no" id="startupSyncNo">No</button>
-      </div>
-    </div>`;
-  document.body.appendChild(modal);
-
-  const close = () => modal.remove();
-  document.getElementById("startupSyncNo")?.addEventListener("click", close);
-  document.getElementById("startupSyncYes")?.addEventListener("click", () => {
-    const yesBtn = document.getElementById("startupSyncYes");
-    if (yesBtn) {
-      yesBtn.textContent = "Syncing...";
-      yesBtn.disabled = true;
-    }
-    const finish = () => {
-      renderInvoiceTable?.();
-      renderMySaleTable?.();
-      close();
-    };
-    syncUserDataFromFirebase(() => {
-      syncMySaleFromFirebase?.(finish);
-    });
-  });
-}
-
-function showLegalPage(page) {
-  const modal = document.getElementById("legalModal");
-  if (!modal) return;
-  const sections = {
-    terms: document.getElementById("legalTerms"),
-    privacy: document.getElementById("legalPrivacy"),
-    about: document.getElementById("legalAbout")
-  };
-  Object.values(sections).forEach(section => section?.classList.add("hidden"));
-  const active = sections[page] || sections.terms;
-  active?.classList.remove("hidden");
-  const title = document.getElementById("legalModalTitle");
-  if (title) {
-    title.textContent = page === "privacy" ? "Privacy Policy" : page === "about" ? "About Me" : "Terms and Conditions";
-  }
-  modal.classList.remove("hidden");
-}
-
-function closeLegalPage() {
-  document.getElementById("legalModal")?.classList.add("hidden");
-}
 
 /* ================================================================
    ✅ FIREBASE SYNC SYSTEM v3.5 (Custom CSV Structure)
@@ -4239,6 +4021,106 @@ function filterRowsForUser(rows, user) {
   return cleanRows.filter(row => getRowUsers(row).includes(cleanUser));
 }
 
+function getUsersFromRows(rows) {
+  const users = new Set();
+  (rows || []).forEach(row => getRowUsers(row).forEach(user => users.add(user)));
+  return [...users].sort((a, b) => a.localeCompare(b));
+}
+
+async function putCsvRowsForUser(user, rows, uploadedBy) {
+  const cleanUser = (user || "").toString().trim().toUpperCase();
+  if (!cleanUser || typeof DATABASE_URL !== "string" || DATABASE_URL.length === 0) return false;
+  const payload = {
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: uploadedBy || getLoggedUser() || cleanUser,
+    rows: rows.map(normalizeMainRow)
+  };
+  const url = `${DATABASE_URL}/csvUploads/${cleanUser}/latest.json`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error(`Upload failed for ${cleanUser}: ${res.status}`);
+  return true;
+}
+
+function getMainRowMergeKey(row) {
+  const clean = normalizeMainRow(row);
+  const users = getRowUsers(clean).join(",");
+  return `${clean.CustomerCode}|${clean.Item1}|${users}`;
+}
+
+function mergeCsvRowsKeepTargets(existingRows, incomingRows) {
+  const merged = {};
+  (existingRows || []).map(normalizeMainRow).forEach(row => {
+    const key = getMainRowMergeKey(row);
+    if (key.replace(/\|/g, "")) merged[key] = row;
+  });
+
+  (incomingRows || []).map(normalizeMainRow).forEach(row => {
+    const key = getMainRowMergeKey(row);
+    if (!key.replace(/\|/g, "")) return;
+    const existing = merged[key];
+    if (existing) {
+      merged[key] = {
+        ...existing,
+        City: row.City || existing.City,
+        Customer: row.Customer || existing.Customer,
+        Target1: row.Target1 > 0 ? row.Target1 : (Number(existing.Target1) || 0),
+        Achieve1: row.Achieve1,
+        User1: row.User1 || existing.User1,
+        User2: row.User2 || existing.User2,
+        DealQty: row.DealQty,
+        DealBonus: row.DealBonus,
+        SummaryNumber: row.SummaryNumber || existing.SummaryNumber,
+        CompanyName: row.CompanyName || existing.CompanyName,
+        Value: row.Value,
+        Date: row.Date || existing.Date,
+        ItemRate: row.ItemRate || existing.ItemRate || 0
+      };
+    } else {
+      merged[key] = row;
+    }
+  });
+  return Object.values(merged);
+}
+
+async function fetchExistingCsvRowsForUser(user) {
+  try {
+    if (typeof DATABASE_URL !== "string" || !DATABASE_URL) return [];
+    const cleanUser = (user || "").toString().trim().toUpperCase();
+    if (!cleanUser) return [];
+    const res = await fetch(`${DATABASE_URL}/csvUploads/${cleanUser}/latest.json`);
+    if (!res.ok) return [];
+    const json = await res.json();
+    return Array.isArray(json?.rows) ? json.rows : [];
+  } catch (err) {
+    console.warn("Existing CSV rows fetch skipped:", err);
+    return [];
+  }
+}
+
+async function saveAdminFullCsvToFirebase(rows, loggedUser) {
+  const cleanRows = rows.map(normalizeMainRow);
+  const existingAllRows = await fetchExistingCsvRowsForUser("ALL");
+  const mergedAllRows = mergeCsvRowsKeepTargets(existingAllRows, cleanRows);
+  await putCsvRowsForUser("ALL", mergedAllRows, loggedUser);
+  const users = getUsersFromRows(mergedAllRows);
+  for (const user of users) {
+    const userIncoming = filterRowsForUser(cleanRows, user);
+    const userExisting = await fetchExistingCsvRowsForUser(user);
+    const userMerged = mergeCsvRowsKeepTargets(userExisting, userIncoming);
+    await putCsvRowsForUser(user, userMerged, loggedUser);
+  }
+  await saveMainCsvSalesToFirebase(mergedAllRows, loggedUser);
+  localStorage.setItem("excelDataAll", JSON.stringify(mergedAllRows));
+  localStorage.setItem("excelData", JSON.stringify(mergedAllRows));
+  localStorage.setItem("lastCsvUploadRef", `${DATABASE_URL}/csvUploads/ALL/latest.json`);
+  console.log(`Central CSV uploaded/merged: ${mergedAllRows.length} rows, ${users.length} user copies.`);
+  return { rows: mergedAllRows.length, users: users.length };
+}
+
 // ----------------- SAVE (MERGE MODE -> keeps old Target1) -----------------
 async function saveCSVToFirebase(data) {
   try {
@@ -4253,7 +4135,6 @@ async function saveCSVToFirebase(data) {
       localStorage.setItem("excelData", JSON.stringify(data));
       return;
     }
-    setActiveDataUser(loggedUser);
 
     if (typeof DATABASE_URL !== "string" || DATABASE_URL.length === 0) {
       console.warn("⚠️ saveCSVToFirebase: DATABASE_URL missing. Saving local only.");
@@ -4261,6 +4142,11 @@ async function saveCSVToFirebase(data) {
       return;
     }
 
+    if (loggedUser.toString().trim().toUpperCase() === "ADMIN") {
+      const result = await saveAdminFullCsvToFirebase(data, loggedUser);
+      console.log(`Admin central upload complete: ${result.rows} rows / ${result.users} users.`);
+      return;
+    }
     const targetUploadUser = getActiveDataUser() || loggedUser.toUpperCase();
     const path = `csvUploads/${targetUploadUser}/latest`;
     const url = `${DATABASE_URL}/${path}.json`;
@@ -4277,67 +4163,7 @@ async function saveCSVToFirebase(data) {
       console.warn("ℹ️ saveCSVToFirebase: No existing latest found or fetch error.", err);
     }
 
-    // 2) Build a lookup from existing by key (CustomerCode|Item1)
-    const lookup = {};
-    existingRows.forEach(r => {
-      const key = ((r.CustomerCode || "") + "|" + (r.Item1 || "")).trim().toUpperCase();
-      lookup[key] = r;
-    });
-
-    // 3) Merge: for each new row update Achieve/Value/Deal fields but keep Target1 if new target is 0
-    const merged = Object.assign({}, lookup); // key -> row
-    data.forEach(newRow => {
-      const code = (newRow.CustomerCode || "").trim().toUpperCase();
-      const item = (newRow.Item1 || "").trim().toUpperCase();
-      const key = (code + "|" + item).trim().toUpperCase();
-      const cleanNew = {
-        City: newRow.City || "",
-        CustomerCode: (newRow.CustomerCode || "").trim().toUpperCase(),
-        Customer: newRow.Customer || "",
-        Item1: (newRow.Item1 || "").trim().toUpperCase(),
-        Target1: parseSafeInt(newRow.Target1),
-        Achieve1: parseSafeInt(newRow.Achieve1),
-        User1: newRow.User1 || "",
-        User2: newRow.User2 || "",
-        DealQty: parseSafeInt(newRow.DealQty),
-        DealBonus: parseSafeInt(newRow.DealBonus),
-        SummaryNumber: newRow.SummaryNumber || "",
-        CompanyName: newRow.CompanyName || "",
-        Value: parseSafeFloat(newRow.Value),
-        Date: newRow.Date || "",
-        ItemRate: parseSafeFloat(newRow.ItemRate)
-      };
-
-      if (merged[key]) {
-        // Keep existing target if new target is zero or missing
-        const existing = merged[key];
-        merged[key] = {
-          ...existing,
-          // fields to keep from existing if new is empty/zero
-          Target1: cleanNew.Target1 > 0 ? cleanNew.Target1 : (parseSafeInt(existing.Target1) || 0),
-          // update Achieve/Value and deal fields to new values (even if 0)
-          Achieve1: cleanNew.Achieve1,
-          Value: cleanNew.Value,
-          DealQty: cleanNew.DealQty,
-          DealBonus: cleanNew.DealBonus,
-          Date: cleanNew.Date || existing.Date || "",
-          ItemRate: cleanNew.ItemRate || existing.ItemRate || 0,
-          // keep general meta fields from either
-          City: cleanNew.City || existing.City,
-          Customer: cleanNew.Customer || existing.Customer,
-          User1: cleanNew.User1 || existing.User1,
-          User2: cleanNew.User2 || existing.User2,
-          SummaryNumber: cleanNew.SummaryNumber || existing.SummaryNumber,
-          CompanyName: cleanNew.CompanyName || existing.CompanyName,
-        };
-      } else {
-        // New entry
-        merged[key] = cleanNew;
-      }
-    });
-
-    // Convert merged lookup back to array
-    const mergedArray = Object.values(merged);
+    const mergedArray = mergeCsvRowsKeepTargets(existingRows, data);
 
     // 4) Upload into latest.json (overwrite safely)
     const payload = {
@@ -4354,13 +4180,14 @@ async function saveCSVToFirebase(data) {
 
     if (putRes.ok) {
       console.log(`✅ saveCSVToFirebase: Uploaded ${mergedArray.length} rows to ${url}`);
+      showAppNotification("CSV data uploaded successfully.", "success");
       localStorage.setItem("excelData", JSON.stringify(mergedArray));
       // also keep lastCsvUploadRef for debugging
       localStorage.setItem("lastCsvUploadRef", url);
     } else {
       console.error("❌ saveCSVToFirebase: Upload failed:", putRes.status);
       // fallback: save locally
-      localStorage.setItem("excelData", JSON.stringify(Object.values(merged)));
+      localStorage.setItem("excelData", JSON.stringify(mergedArray));
     }
   } catch (err) {
     console.error("❌ saveCSVToFirebase Error:", err);
@@ -4413,7 +4240,7 @@ function processCSVData(data, onDone) {
     if (!Array.isArray(data)) data = [];
 
     // Normalize fields types and defaults
-    const normalizedRows = data.map(r => ({
+    excelData = data.map(r => ({
       City: r.City || "",
       CustomerCode: (r.CustomerCode || "").toString().trim().toUpperCase(),
       Customer: r.Customer || "",
@@ -4431,15 +4258,7 @@ function processCSVData(data, onDone) {
       ItemRate: parseSafeFloat(r.ItemRate)
     }));
 
-    fullExcelData = normalizedRows;
-    localStorage.setItem("excelDataAll", JSON.stringify(fullExcelData));
-    excelData = getDateFilteredRows(fullExcelData);
-    if (!bookerRankSourceRows.length) {
-      bookerRankSourceRows = excelData;
-      localStorage.setItem("bookerRankSourceRows", JSON.stringify(bookerRankSourceRows));
-    }
-
-    // Save filtered backup for the current dashboard view
+    // Save backup
     localStorage.setItem("excelData", JSON.stringify(excelData));
 
     // Recompute invoices (these are based on Achieve1)
@@ -4471,8 +4290,6 @@ invoices = excelData
     });
     localStorage.setItem("bonusDeals", JSON.stringify(bonusDeals));
 
-    syncMySaleFromFirebase();
-
     // Build customer targets and UI data
     buildCustomerTargets();
 
@@ -4481,9 +4298,6 @@ invoices = excelData
     if (typeof renderMySaleTable === "function") renderMySaleTable();
     if (typeof renderBonusDeals === "function") renderBonusDeals();
     if (typeof populateBonusItems === "function") populateBonusItems();
-    if (typeof setupDateRangeControls === "function") setupDateRangeControls();
-    if (typeof renderBookerRankingBox === "function") renderBookerRankingBox();
-    if (typeof syncBookerRankingsFromFirebase === "function") syncBookerRankingsFromFirebase();
 
     if (onDone) onDone(excelData);
   } catch (err) {
@@ -4493,56 +4307,248 @@ invoices = excelData
 }
 
 // ----------------- SYNC from Firebase (loads only latest.json) -----------------
-async function syncUserDataFromFirebase(onDone) {
+// =======================
+// Upgraded sync with ADMIN override
+// Replace existing syncUserDataFromFirebase with this version
+// =======================
+async function syncUserDataFromFirebase(onDone, forceUser = null) {
   try {
     const loggedUser = getLoggedUser();
     if (!loggedUser) {
-      console.warn("syncUserDataFromFirebase: No logged-in user.");
+      console.warn('⚠️ syncUserDataFromFirebase: No logged-in user.');
       if (onDone) onDone([]);
       return;
     }
 
+    // Normalize usernames to uppercase for paths
+    const currentUser = loggedUser.toString().trim().toUpperCase();
+
+    // If caller provided a forceUser AND current logged user is ADMIN -> allow override
+    let targetUser = null;
+    if (forceUser && currentUser === 'ADMIN') {
+      targetUser = forceUser.toString().trim().toUpperCase();
+      setActiveDataUser(targetUser);
+      console.log(`🔐 ADMIN override: syncing data for user ${targetUser}`);
+    } else {
+      // default: sync for the logged-in user only
+      targetUser = currentUser;
+      setActiveDataUser(targetUser);
+    }
+
     if (typeof DATABASE_URL !== "string" || DATABASE_URL.length === 0) {
-      console.warn("syncUserDataFromFirebase: DATABASE_URL missing. Loading local data.");
+      console.warn("⚠️ syncUserDataFromFirebase: DATABASE_URL missing. Loading local data.");
       const local = JSON.parse(localStorage.getItem("excelData") || "[]");
       processCSVData(local, onDone);
       return;
     }
 
-    async function fetchLatestRows(user) {
-      const cleanUser = (user || "").toString().trim().toUpperCase();
-      if (!cleanUser) return null;
-      const url = `${DATABASE_URL}/csvUploads/${cleanUser}/latest.json`;
-      console.log("syncUserDataFromFirebase: fetching", url);
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      const json = await res.json();
-      if (!json || !Array.isArray(json.rows) || json.rows.length === 0) return null;
-      return json.rows;
-    }
+    // Fetch all uploads for the target user (not latest.json only)
+    const url = `${DATABASE_URL}/csvUploads/${targetUser}.json`;
+    console.log("🔄 syncUserDataFromFirebase: fetching", url);
 
-    const targetUploadUser = getActiveDataUser() || loggedUser.toUpperCase();
-    let rows = await fetchLatestRows(targetUploadUser);
-
-    if (!rows || !rows.length) {
-      const centralRows = await fetchLatestRows("ALL");
-      rows = centralRows ? filterRowsForUser(centralRows, loggedUser) : null;
-    }
-
-    if (!rows || !rows.length) {
-      console.warn("syncUserDataFromFirebase: no online rows found, using local backup.");
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn("⚠️ syncUserDataFromFirebase: fetch returned", res.status);
       const local = JSON.parse(localStorage.getItem("excelData") || "[]");
       processCSVData(local, onDone);
       return;
     }
 
-    processCSVData(rows, onDone);
+    const json = await res.json();
+    // If ADMIN override used, json may contain multiple upload nodes; flatten them into rows
+    let allRows = [];
+    if (json) {
+      // If structure is { latest: { rows: [...] }, otherUpload: { rows: [...] }, ... }
+      const values = Object.values(json);
+      values.forEach(v => {
+        if (!v) return;
+        if (Array.isArray(v.rows)) {
+          allRows = allRows.concat(v.rows);
+        } else if (Array.isArray(v)) {
+          // sometimes direct array stored
+          allRows = allRows.concat(v);
+        } else if (v.rows && Array.isArray(v.rows)) {
+          allRows = allRows.concat(v.rows);
+        }
+      });
+    }
+
+    if (!allRows || allRows.length === 0) {
+      console.warn('⚠️ syncUserDataFromFirebase: No rows found for', targetUser, '- falling back to local.');
+      const local = JSON.parse(localStorage.getItem("excelData") || "[]");
+      processCSVData(local, onDone);
+      return;
+    }
+
+    console.log(`✅ syncUserDataFromFirebase: fetched ${allRows.length} rows for user ${targetUser}`);
+    // processCSVData will normalize and render; it expects an array of row objects
+    processCSVData(allRows, onDone);
   } catch (err) {
-    console.error("syncUserDataFromFirebase Error:", err);
+    console.error("❌ syncUserDataFromFirebase Error:", err);
     const local = JSON.parse(localStorage.getItem("excelData") || "[]");
     processCSVData(local, onDone);
   }
 }
+
+// =======================
+// Helper to sync currently-selected user in UI (works without changing HTML)
+// - tries common select element ids, otherwise asks via prompt
+// Attach this to your Sync button if you want admin to pick from UI.
+// =======================
+function syncSelectedUser() {
+  const btn = document.getElementById('syncBtn');
+  if (btn) {
+    btn.innerText = "⏳ Syncing...";
+    btn.disabled = true;
+  }
+
+  // try different possible element ids that might exist in your HTML
+  const possibleIds = ['userSelect', 'userFilter', 'userDropdown', 'userList', 'user'];
+  let selected = null;
+  for (const id of possibleIds) {
+    const el = document.getElementById(id);
+    if (el) {
+      selected = (el.value || el.options?.[el.selectedIndex]?.value || '').toString().trim();
+      if (selected) break;
+    }
+  }
+
+  // fallback: if not found or empty, ask admin
+  if (!selected) {
+    // only prompt if current user is ADMIN (otherwise we should not allow override)
+    const currentUser = (getLoggedUser() || '').toString().trim().toUpperCase();
+    if (currentUser === 'ADMIN') {
+      selected = prompt('Enter username to sync (e.g. ND, ASIF). Leave empty to sync ADMIN data:');
+      if (!selected) selected = null;
+    }
+  }
+
+  // Call sync with override only when ADMIN selected someone
+  const currentUser = (getLoggedUser() || '').toString().trim().toUpperCase();
+  if (currentUser === 'ADMIN' && selected) {
+    syncUserDataFromFirebase(async () => {
+      await syncMySaleFromFirebase?.(null, selected);
+      if (btn) {
+        showAppNotification('Data synced successfully for ' + selected.toUpperCase() + '.', 'success');
+        btn.innerText = "🔄 Sync Data";
+        btn.disabled = false;
+        renderInvoiceTable();
+      }
+    }, selected);
+  } else {
+    // normal sync (no override)
+    syncUserDataFromFirebase(async () => {
+      await syncMySaleFromFirebase?.();
+      if (btn) {
+        showAppNotification('Data synced successfully.', 'success');
+        btn.innerText = "🔄 Sync Data";
+        btn.disabled = false;
+        renderInvoiceTable();
+      }
+    });
+  }
+}
+
+let startupSyncPromptShown = false;
+
+function getSelectedSyncUserForPrompt() {
+  const ids = ["userSelect", "userFilter", "userDropdown", "userList", "user"];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    const value = (el?.value || el?.options?.[el.selectedIndex]?.value || "").toString().trim();
+    if (value) return value.toUpperCase();
+  }
+  return "";
+}
+
+function showStartupSyncPrompt() {
+  if (startupSyncPromptShown || document.getElementById("startupSyncPrompt")) return;
+  if (!(getLoggedUser && getLoggedUser())) return;
+  startupSyncPromptShown = true;
+
+  const modal = document.createElement("div");
+  modal.id = "startupSyncPrompt";
+  modal.className = "startup-sync-overlay";
+  modal.innerHTML = `
+    <div class="startup-sync-card">
+      <h2>SYNC NOW</h2>
+      <p>Fresh Firebase data load karna hai? Yes press karen to selected user data abhi sync ho jayega.</p>
+      <div class="startup-sync-actions">
+        <button type="button" class="startup-sync-yes" id="startupSyncYes">Yes</button>
+        <button type="button" class="startup-sync-no" id="startupSyncNo">No</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const close = () => modal.remove();
+  document.getElementById("startupSyncNo")?.addEventListener("click", close);
+  document.getElementById("startupSyncYes")?.addEventListener("click", () => {
+    const yesBtn = document.getElementById("startupSyncYes");
+    if (yesBtn) {
+      yesBtn.textContent = "Syncing...";
+      yesBtn.disabled = true;
+    }
+    const currentUser = (getLoggedUser() || "").toString().trim().toUpperCase();
+    const selected = getSelectedSyncUserForPrompt();
+    const finish = () => {
+      renderInvoiceTable?.();
+      renderMySaleTable?.();
+      close();
+    };
+    if (currentUser === "ADMIN" && selected) {
+      syncUserDataFromFirebase(() => {
+        syncMySaleFromFirebase?.(finish, selected);
+      }, selected);
+    } else {
+      syncUserDataFromFirebase(() => {
+        syncMySaleFromFirebase?.(finish);
+      });
+    }
+  });
+}
+
+function showLegalPage(page) {
+  const modal = document.getElementById("legalModal");
+  if (!modal) return;
+  const sections = {
+    terms: document.getElementById("legalTerms"),
+    privacy: document.getElementById("legalPrivacy"),
+    about: document.getElementById("legalAbout")
+  };
+  Object.values(sections).forEach(section => section?.classList.add("hidden"));
+  const active = sections[page] || sections.terms;
+  active?.classList.remove("hidden");
+  const title = document.getElementById("legalModalTitle");
+  if (title) {
+    title.textContent = page === "privacy" ? "Privacy Policy" : page === "about" ? "About Me" : "Terms and Conditions";
+  }
+  modal.classList.remove("hidden");
+}
+
+function closeLegalPage() {
+  document.getElementById("legalModal")?.classList.add("hidden");
+}
+
+function showAppNotification(message, type = "success") {
+  let stack = document.getElementById("appToastStack");
+  if (!stack) {
+    stack = document.createElement("div");
+    stack.id = "appToastStack";
+    stack.className = "app-toast-stack";
+    document.body.appendChild(stack);
+  }
+  const toast = document.createElement("div");
+  toast.className = `app-toast ${type}`;
+  toast.textContent = message;
+  stack.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("show"));
+  setTimeout(() => {
+    toast.classList.remove("show");
+    setTimeout(() => toast.remove(), 260);
+  }, 3200);
+}
+
+
 /* ================================================================
    ✅ END Robust Sync System
 ================================================================ */
@@ -4594,8 +4600,6 @@ function calculateSmartPerformance() {
         ? (totalCustomerScore / customerCount).toFixed(1)
         : 0;
 }
-
-
 
 function openCustomerPopup(customerCode) {
 
@@ -4798,7 +4802,6 @@ function openCustomerPopup(customerCode) {
 }
 
 
-
 function searchCustomerFromMain() {
   const input = document.getElementById("mainCustomerSearch");
   const list = document.getElementById("mainCustomerSuggestions");
@@ -4843,6 +4846,8 @@ function openCustomerFromMain(customerCode) {
   // Allocation table render
   renderAllocationTables(customerCode);
 }
+
+
 
 
 
