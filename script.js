@@ -197,7 +197,12 @@ if (lastMeta.hash === currentHash && lastMeta.user === loggedUser) {
   }));
 
   // ✅ Upload processed data to Realtime DB
-  saveCSVToFirebase(mapped);
+  const savePromise = saveCSVToFirebase(mapped);
+  if (savePromise && typeof savePromise.then === "function") {
+    savePromise.then((mergedRows) => {
+      if (Array.isArray(mergedRows)) processCSVData(mergedRows, onDone);
+    }).catch(err => console.error("CSV merge refresh failed:", err));
+  }
 
   // ✅ Optional: upload raw file (only if available)
   try {
@@ -2179,11 +2184,10 @@ function renderAllocationTables(customerCode = null) {
 
         const achieved = matchingInvoices.reduce((sum, inv) => sum + Number(inv.quantity), 0);
         const achievedValue = matchingInvoices.reduce((sum, inv) => sum + (Number(inv.quantity) * Number(inv.rate)), 0);
-        const cappedAchieved = Math.min(achieved, target);
         const remaining = target - achieved;
 
         totalTarget += target;
-        totalAchieved += cappedAchieved;
+        totalAchieved += achieved;
         totalRemaining += Math.max(remaining, 0);
         totalAchievedValue += achievedValue;
         totalItems++;
@@ -2229,6 +2233,7 @@ function renderAllocationTables(customerCode = null) {
     }
 
     const overallPercent = totalTarget > 0 ? ((totalAchieved / totalTarget) * 100).toFixed(1) : 0;
+    const overallBarPercent = Math.min(Number(overallPercent) || 0, 100);
 
     // --- Final HTML Output ---
     tablesContainer.innerHTML = `
@@ -2294,7 +2299,7 @@ function renderAllocationTables(customerCode = null) {
             <h3 class="font-semibold mb-2">📈 Overall Achievement</h3>
             <div class="w-full bg-gray-200 rounded-full h-6 overflow-hidden">
                 <div class="h-6 text-xs flex items-center justify-center font-bold text-white rounded-full"
-                     style="width:${overallPercent}%; background: linear-gradient(to right, #60a5fa, #16a34a); transition: width 0.6s ease;">
+                     style="width:${overallBarPercent}%; background: linear-gradient(to right, #60a5fa, #16a34a); transition: width 0.6s ease;">
                     ${overallPercent}%
                 </div>
             </div>
@@ -3307,6 +3312,43 @@ function toggleSections() {
 // load existing data (single declaration)
 let mySaleData = JSON.parse(localStorage.getItem("mySaleData") || "[]");
 
+const MANUAL_SALE_COMPANIES = {
+  "1": "SMITH KLINE GSK",
+  "3": "SANOFI",
+  "4": "GALAXY",
+  "5": "ABBOTT LAB",
+  "6": "HILTON",
+  "8": "HIGHNOON",
+  "10": "SOLITE HEALTH CARE",
+  "11": "OTSUKA",
+  "12": "ABBOTT INST",
+  "14": "GSK CONSUMER",
+  "15": "CARE"
+};
+
+function getManualSaleCompanyName(code) {
+  const cleanCode = (code || "").toString().trim();
+  if (!cleanCode) return "";
+  if (MANUAL_SALE_COMPANIES[cleanCode]) return MANUAL_SALE_COMPANIES[cleanCode];
+  const row = (excelData || []).find(item => String(item.SummaryNumber || item.SUMMERY || item.Summary || "").trim() === cleanCode);
+  return row ? (row.CompanyName || row.Company || row.COMPANY || "") : "";
+}
+
+function syncManualSaleCompanyInput() {
+  const numberInput = document.getElementById("manualSaleNumber");
+  const companyInput = document.getElementById("manualSaleCompany");
+  if (!numberInput || !companyInput) return;
+  companyInput.value = getManualSaleCompanyName(numberInput.value);
+}
+
+function setupManualSaleCompanyAutoFill() {
+  const numberInput = document.getElementById("manualSaleNumber");
+  if (!numberInput || numberInput.dataset.companyAutofillReady === "1") return;
+  numberInput.dataset.companyAutofillReady = "1";
+  numberInput.addEventListener("input", syncManualSaleCompanyInput);
+  syncManualSaleCompanyInput();
+}
+
 // show / hide pages and mark active nav
 function showMySalePage() {
   // hide all other pages
@@ -3337,6 +3379,7 @@ function showMySalePage() {
     renderMySaleTable();
   }
   renderSaleUploadHistory();
+  setupManualSaleCompanyAutoFill();
 }
 
 
@@ -3825,6 +3868,7 @@ async function syncMySaleFromFirebase(onDone) {
 
 function addManualSale() {
   const summary = document.getElementById("manualSaleNumber")?.value || "";
+  syncManualSaleCompanyInput();
   const company = document.getElementById("manualSaleCompany")?.value || "";
   const value = Number(document.getElementById("manualSaleValue")?.value || 0);
   const date = document.getElementById("manualSaleDate")?.value || new Date().toISOString().slice(0, 10);
@@ -4329,7 +4373,8 @@ function normalizeMainRow(row) {
 function getRowUsers(row) {
   return [...new Set([row.User1, row.User2]
     .map(user => (user || "").toString().trim().toUpperCase())
-    .filter(user => user && user !== "ADMIN" && user !== "ALL"))];
+    .filter(user => user && user !== "ADMIN" && user !== "ALL"))]
+    .sort((a, b) => a.localeCompare(b));
 }
 
 function filterRowsForUser(rows, user) {
@@ -4342,26 +4387,56 @@ function filterRowsForUser(rows, user) {
 function getMainRowMergeKey(row) {
   const clean = normalizeMainRow(row);
   const users = getRowUsers(clean).join(",");
-  return `${clean.CustomerCode}|${clean.Item1}|${users}`;
+  return [
+    clean.CustomerCode,
+    clean.Item1,
+    clean.SummaryNumber || "",
+    clean.CompanyName || "",
+    clean.Date || "",
+    users
+  ].join("|").toUpperCase();
+}
+
+function getMainRowTargetKey(row) {
+  const clean = normalizeMainRow(row);
+  const users = getRowUsers(clean).join(",");
+  return [clean.CustomerCode, clean.Item1, users].join("|").toUpperCase();
+}
+
+function buildTargetCarryMap(rows) {
+  const targets = {};
+  (rows || []).map(normalizeMainRow).forEach(row => {
+    const key = getMainRowTargetKey(row);
+    if (!key.replace(/\|/g, "")) return;
+    if (Number(row.Target1 || 0) > 0) targets[key] = Number(row.Target1 || 0);
+  });
+  return targets;
 }
 
 function mergeCsvRowsKeepTargets(existingRows, incomingRows) {
   const merged = {};
-  (existingRows || []).map(normalizeMainRow).forEach(row => {
+  const existingClean = (existingRows || []).map(normalizeMainRow);
+  const incomingClean = (incomingRows || []).map(normalizeMainRow);
+  const targetCarry = buildTargetCarryMap(existingClean.concat(incomingClean));
+
+  existingClean.forEach(row => {
     const key = getMainRowMergeKey(row);
     if (key.replace(/\|/g, "")) merged[key] = row;
   });
 
-  (incomingRows || []).map(normalizeMainRow).forEach(row => {
+  incomingClean.forEach(row => {
     const key = getMainRowMergeKey(row);
     if (!key.replace(/\|/g, "")) return;
     const existing = merged[key];
+    const carryTarget = Number(row.Target1 || 0) > 0
+      ? Number(row.Target1 || 0)
+      : Number(targetCarry[getMainRowTargetKey(row)] || 0);
     if (existing) {
       merged[key] = {
         ...existing,
         City: row.City || existing.City,
         Customer: row.Customer || existing.Customer,
-        Target1: row.Target1 > 0 ? row.Target1 : (Number(existing.Target1) || 0),
+        Target1: carryTarget > 0 ? carryTarget : (Number(existing.Target1) || 0),
         Achieve1: row.Achieve1,
         User1: row.User1 || existing.User1,
         User2: row.User2 || existing.User2,
@@ -4374,7 +4449,7 @@ function mergeCsvRowsKeepTargets(existingRows, incomingRows) {
         ItemRate: row.ItemRate || existing.ItemRate || 0
       };
     } else {
-      merged[key] = row;
+      merged[key] = { ...row, Target1: carryTarget > 0 ? carryTarget : row.Target1 };
     }
   });
   return Object.values(merged);
@@ -4439,15 +4514,18 @@ async function saveCSVToFirebase(data) {
       localStorage.setItem("excelData", JSON.stringify(mergedArray));
       // also keep lastCsvUploadRef for debugging
       localStorage.setItem("lastCsvUploadRef", url);
+      return mergedArray;
     } else {
       console.error("❌ saveCSVToFirebase: Upload failed:", putRes.status);
       // fallback: save locally
       localStorage.setItem("excelData", JSON.stringify(mergedArray));
+      return mergedArray;
     }
   } catch (err) {
     console.error("❌ saveCSVToFirebase Error:", err);
     // fallback: save locally
     try { localStorage.setItem("excelData", JSON.stringify(data)); } catch(e){}
+    return data;
   }
 }
 
@@ -4710,12 +4788,11 @@ function openCustomerPopup(customerCode) {
 
         const achieved = inv.reduce((a, b) => a + Number(b.quantity || 0), 0);
         const achievedValue = inv.reduce((a, b) => a + (Number(b.quantity) * Number(b.rate)), 0);
-        const capped = Math.min(achieved, target);
         const remaining = target - achieved;
 
         totalItems++;
         totalTarget += target;
-        totalAchieved += capped;
+        totalAchieved += achieved;
         totalRemaining += Math.max(remaining, 0);
         totalAchievedValue += achievedValue;
 
@@ -4750,6 +4827,7 @@ function openCustomerPopup(customerCode) {
     });
 
     const overall = totalTarget > 0 ? ((totalAchieved / totalTarget) * 100).toFixed(1) : 0;
+    const overallBar = Math.min(Number(overall) || 0, 100);
 
     // ---------- FINAL POPUP UI ----------
     const popup = `
@@ -4817,7 +4895,7 @@ function openCustomerPopup(customerCode) {
                 <h3 class="font-semibold mb-2">📈 Overall Achievement</h3>
                 <div class="w-full bg-gray-200 rounded-full h-6 overflow-hidden">
                     <div class="h-6 text-xs flex items-center justify-center font-bold text-white rounded-full"
-                         style="width:${overall}%; background: linear-gradient(to right, #60a5fa, #16a34a);">
+                         style="width:${overallBar}%; background: linear-gradient(to right, #60a5fa, #16a34a);">
                         ${overall}%
                     </div>
                 </div>
